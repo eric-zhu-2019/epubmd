@@ -69,7 +69,7 @@ struct ContentView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Text("EPUB to Markdown")
+            Text("epubmd")
                 .font(.title)
                 .bold()
 
@@ -128,7 +128,7 @@ struct ContentView: View {
 }
 
 @main
-struct EpubMarkdownApp: App {
+struct EpubmdApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView()
