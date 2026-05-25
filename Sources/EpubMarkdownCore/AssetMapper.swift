@@ -29,6 +29,32 @@ struct AssetMapper {
         }
     }
 
+    mutating func copyReferencedAssetIfPresent(href: String, contentBaseDirectory: String, extractedRoot: URL, outputRoot: URL) throws -> String? {
+        let noFragment = PathResolver.removingFragment(href)
+        let absolute = PathResolver.normalize(PathResolver.join(contentBaseDirectory, noFragment))
+        if let existing = markdownPath(for: href, contentBaseDirectory: contentBaseDirectory) {
+            return existing
+        }
+
+        let source = extractedRoot.appendingPathComponent(absolute)
+        guard FileManager.default.fileExists(atPath: source.path) else { return nil }
+
+        let assetsDirectory = outputRoot.appendingPathComponent("assets", isDirectory: true)
+        try FileManager.default.createDirectory(at: assetsDirectory, withIntermediateDirectories: true, attributes: nil)
+        let fileName = uniqueFileName(for: absolute)
+        let destination = assetsDirectory.appendingPathComponent(fileName)
+        do {
+            try FileManager.default.copyItem(at: source, to: destination)
+        } catch {
+            throw ConversionError.protectedEpub("asset could not be copied normally: \(absolute)")
+        }
+        let markdownPath = "../assets/\(fileName)"
+        hrefToMarkdownPath[absolute] = markdownPath
+        hrefToMarkdownPath[noFragment] = markdownPath
+        copiedAssets.append(destination)
+        return markdownPath
+    }
+
     func markdownPath(for href: String, contentBaseDirectory: String) -> String? {
         let noFragment = PathResolver.removingFragment(href)
         let absolute = PathResolver.normalize(PathResolver.join(contentBaseDirectory, noFragment))

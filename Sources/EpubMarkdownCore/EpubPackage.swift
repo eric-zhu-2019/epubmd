@@ -144,9 +144,20 @@ struct PathResolver {
     }
 
     static func normalize(_ path: String) -> String {
-        let ns = path as NSString
-        let components = ns.standardizingPath.split(separator: "/").map(String.init)
-        return components.joined(separator: "/")
+        var normalized: [String] = []
+        for component in path.split(separator: "/", omittingEmptySubsequences: true).map(String.init) {
+            switch component {
+            case ".":
+                continue
+            case "..":
+                if !normalized.isEmpty {
+                    normalized.removeLast()
+                }
+            default:
+                normalized.append(component)
+            }
+        }
+        return normalized.joined(separator: "/")
     }
 
     static func removingFragment(_ href: String) -> String {

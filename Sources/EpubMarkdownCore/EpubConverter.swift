@@ -9,6 +9,46 @@ public final class EpubConverter {
         self.writer = OutputWriter(fileManager: fileManager)
     }
 
+    public func convertToZip(epubURL: URL, outputZipURL: URL, overwrite: Bool = false) throws -> URL {
+        let destination = outputZipURL.pathExtension.lowercased() == "zip" ? outputZipURL : outputZipURL.appendingPathExtension("zip")
+        let parent = destination.deletingLastPathComponent()
+        try fileManager.createDirectory(at: parent, withIntermediateDirectories: true, attributes: nil)
+        if fileManager.fileExists(atPath: destination.path) {
+            guard overwrite else {
+                throw ConversionError.fileSystem("destination zip already exists: \(destination.path). Use --force to replace it")
+            }
+            try fileManager.removeItem(at: destination)
+        }
+
+        let tempParent = parent.appendingPathComponent(".epubmd-zip-\(UUID().uuidString)", isDirectory: true)
+        try fileManager.createDirectory(at: tempParent, withIntermediateDirectories: true, attributes: nil)
+        defer { writer.cleanup(tempParent) }
+
+        let result = try convert(epubURL: epubURL, outputParentDirectory: tempParent)
+        try createZip(fromContentsOf: result.outputDirectory, to: destination)
+        return destination
+    }
+
+    private func createZip(fromContentsOf sourceDirectory: URL, to destination: URL) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+        process.arguments = ["-c", "-k", "--norsrc", sourceDirectory.path, destination.path]
+
+        let errorPipe = Pipe()
+        process.standardError = errorPipe
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {
+            throw ConversionError.fileSystem("could not launch zip tool: \(error.localizedDescription)")
+        }
+        guard process.terminationStatus == 0 else {
+            let data = errorPipe.fileHandleForReading.readDataToEndOfFile()
+            let message = String(data: data, encoding: .utf8)?.nilIfEmpty ?? "ditto exited with status \(process.terminationStatus)"
+            throw ConversionError.fileSystem("could not create zip: \(message)")
+        }
+    }
+
     public func convert(epubURL: URL, outputParentDirectory: URL) throws -> ConversionResult {
         let workRoot = outputParentDirectory.appendingPathComponent(".epub-markdown-work-\(UUID().uuidString)", isDirectory: true)
         let extracted = workRoot.appendingPathComponent("extracted", isDirectory: true)
@@ -54,7 +94,7 @@ public final class EpubConverter {
             let converter = HTMLToMarkdownConverter()
             var markdownFiles: [URL] = []
             for chapter in chapterData {
-                try validateReferencedImages(in: chapter.data, currentEpubPath: chapter.spineItem.item.absolutePath, assetMapper: assetMapper)
+                try ensureReferencedImagesAreAvailable(in: chapter.data, currentEpubPath: chapter.spineItem.item.absolutePath, extractedRoot: extracted, outputRoot: stagingURL, assetMapper: &assetMapper)
                 let markdown = try converter.convert(data: chapter.data, currentEpubPath: chapter.spineItem.item.absolutePath, assetMapper: assetMapper, chapterLinks: chapterLinks, packageBase: package.baseDirectory)
                 let destination = chaptersDirectory.appendingPathComponent(chapter.fileName)
                 try writer.write(markdown, to: destination)
@@ -83,14 +123,14 @@ public final class EpubConverter {
         }
     }
 
-    private func validateReferencedImages(in data: Data, currentEpubPath: String, assetMapper: AssetMapper) throws {
+    private func ensureReferencedImagesAreAvailable(in data: Data, currentEpubPath: String, extractedRoot: URL, outputRoot: URL, assetMapper: inout AssetMapper) throws {
         guard let root = try? TreeXMLParser.parse(data: data) else { return }
         let contentBaseDirectory = (currentEpubPath as NSString).deletingLastPathComponent
         for image in root.descendants(named: "img") {
             guard let src = image.attributes["src"], !src.isEmpty else { continue }
             let lower = src.lowercased()
             if lower.hasPrefix("http://") || lower.hasPrefix("https://") || lower.hasPrefix("data:") { continue }
-            if assetMapper.markdownPath(for: src, contentBaseDirectory: contentBaseDirectory) == nil {
+            if try assetMapper.copyReferencedAssetIfPresent(href: src, contentBaseDirectory: contentBaseDirectory, extractedRoot: extractedRoot, outputRoot: outputRoot) == nil {
                 throw ConversionError.malformedEpub("referenced image asset is missing or not declared: \(src)")
             }
         }

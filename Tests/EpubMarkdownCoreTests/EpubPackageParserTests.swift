@@ -20,6 +20,13 @@ final class EpubPackageParserTests: XCTestCase {
         XCTAssertEqual(package.manifest["img"]?.absolutePath, "OEBPS/images/pic.png")
     }
 
+    func testPathResolverNormalizesParentDirectorySegments() {
+        XCTAssertEqual(
+            PathResolver.normalize("OEBPS/Text/../media/resources/title_page.png"),
+            "OEBPS/media/resources/title_page.png"
+        )
+    }
+
     func testMissingContainerFailsClearly() throws {
         let epub = try TestSupport.makeSyntheticEpub(missingContainer: true)
         let extract = try TestSupport.makeTempDirectory()

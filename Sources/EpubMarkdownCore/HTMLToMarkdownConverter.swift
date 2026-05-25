@@ -218,7 +218,61 @@ public struct HTMLToMarkdownConverter {
     private func cleanup(_ markdown: String) -> String {
         var value = markdown.replacingOccurrences(of: "[ \\t]+", with: " ", options: .regularExpression)
         value = value.replacingOccurrences(of: "\\n{3,}", with: "\n\n", options: .regularExpression)
+        value = removeDuplicateLeadingTitleBlocks(from: value)
         return value.trimmingCharacters(in: .whitespacesAndNewlines) + "\n"
+    }
+
+    private func removeDuplicateLeadingTitleBlocks(from markdown: String) -> String {
+        let blocks = markdown.components(separatedBy: "\n\n")
+        guard blocks.count >= 2 else { return markdown }
+
+        var result = blocks
+        var index = 1
+        while index < min(result.count, 4) {
+            let previous = titleComparableText(result[index - 1])
+            let current = titleComparableText(result[index])
+            guard !previous.isEmpty, previous == current else {
+                index += 1
+                continue
+            }
+            let previousIsHeading = isHeadingBlock(result[index - 1])
+            let currentIsHeading = isHeadingBlock(result[index])
+            let looksLikeLeadingPlainTitle = index == 1 && previous.count <= 100 && current.count <= 100
+            guard previousIsHeading || currentIsHeading || looksLikeLeadingPlainTitle else {
+                index += 1
+                continue
+            }
+
+            if currentIsHeading || !previousIsHeading {
+                result.remove(at: index - 1)
+            } else {
+                result.remove(at: index)
+            }
+        }
+        return result.joined(separator: "\n\n")
+    }
+
+    private func isHeadingBlock(_ block: String) -> Bool {
+        return block
+            .split(separator: "\n")
+            .contains { line in
+                line.trimmingCharacters(in: .whitespaces).range(of: "^#{1,6}\\s+", options: .regularExpression) != nil
+            }
+    }
+
+    private func titleComparableText(_ block: String) -> String {
+        var lines = block.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        lines.removeAll { line in
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.range(of: "^<a\\s+id=\"[^\"]+\"></a>$", options: .regularExpression) != nil
+        }
+        var value = lines.joined(separator: " ")
+        value = value.replacingOccurrences(of: "^#{1,6}\\s+", with: "", options: .regularExpression)
+        value = value.replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression)
+        value = value.replacingOccurrences(of: "[*_`]+", with: "", options: .regularExpression)
+        value = value.replacingOccurrences(of: "\\[[^\\]]+\\]\\(([^)]+)\\)", with: "$1", options: .regularExpression)
+        value = value.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+        return value.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
 

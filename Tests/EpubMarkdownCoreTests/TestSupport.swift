@@ -15,7 +15,7 @@ final class TestSupport {
         try string.data(using: .utf8)!.write(to: url)
     }
 
-    static func makeSyntheticEpub(includeEncryption: Bool = false, missingContainer: Bool = false, malformedContainer: Bool = false, missingOPF: Bool = false, missingSpineReference: Bool = false, missingAsset: Bool = false) throws -> URL {
+    static func makeSyntheticEpub(includeEncryption: Bool = false, missingContainer: Bool = false, malformedContainer: Bool = false, missingOPF: Bool = false, missingSpineReference: Bool = false, missingAsset: Bool = false, declareAsset: Bool = true) throws -> URL {
         let root = try makeTempDirectory()
         let epubRoot = root.appendingPathComponent("book", isDirectory: true)
         try FileManager.default.createDirectory(at: epubRoot, withIntermediateDirectories: true, attributes: nil)
@@ -36,6 +36,7 @@ final class TestSupport {
         }
         if !missingOPF {
             let secondSpineRef = missingSpineReference ? "missing" : "chap2"
+            let assetManifestItem = declareAsset ? #"<item id="img" href="images/pic.png" media-type="image/png"/>"# : ""
             try write("""
             <?xml version="1.0" encoding="UTF-8"?>
             <package xmlns:dc="http://purl.org/dc/elements/1.1/">
@@ -50,7 +51,7 @@ final class TestSupport {
               <manifest>
                 <item id="chap1" href="chapter1.xhtml" media-type="application/xhtml+xml"/>
                 <item id="chap2" href="chapter2.xhtml" media-type="application/xhtml+xml"/>
-                <item id="img" href="images/pic.png" media-type="image/png"/>
+                \(assetManifestItem)
               </manifest>
               <spine>
                 <itemref idref="chap1"/>

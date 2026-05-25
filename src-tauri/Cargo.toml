@@ -1,0 +1,21 @@
+[package]
+name = "epubmd-reader"
+version = "0.1.0"
+description = "Reader for epubmd Markdown zip archives"
+authors = ["epubmd"]
+edition = "2021"
+
+[lib]
+name = "epubmd_reader_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+base64 = "0.22"
+mime_guess = "2"
+serde = { version = "1", features = ["derive"] }
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+zip = "2"

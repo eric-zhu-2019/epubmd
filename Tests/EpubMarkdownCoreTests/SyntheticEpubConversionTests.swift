@@ -32,6 +32,18 @@ final class SyntheticEpubConversionTests: XCTestCase {
         XCTAssertTrue(style.contains("max-width: 78ch;"))
     }
 
+    func testConversionCopiesExistingReferencedAssetWhenManifestOmitsIt() throws {
+        let epub = try TestSupport.makeSyntheticEpub(declareAsset: false)
+        let outputParent = try TestSupport.makeTempDirectory("undeclared-asset")
+        let result = try EpubConverter().convert(epubURL: epub, outputParentDirectory: outputParent)
+
+        let first = result.outputDirectory.appendingPathComponent("chapters/001-Opening.md")
+        let firstText = try String(contentsOf: first)
+        XCTAssertTrue(firstText.contains("![Picture](../assets/"))
+        XCTAssertEqual(result.assetFiles.count, 1)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: result.assetFiles[0].path))
+    }
+
     func testExistingDestinationCreatesUniqueFolder() throws {
         let epub = try TestSupport.makeSyntheticEpub()
         let outputParent = try TestSupport.makeTempDirectory("collision")

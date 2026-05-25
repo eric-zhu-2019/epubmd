@@ -25,7 +25,7 @@ struct OutputWriter {
     }
 
     func chapterFileName(index: Int, title: String?, fallback: String) -> String {
-        let base = sanitizeFileName(title?.nilIfEmpty ?? ((fallback as NSString).deletingPathExtension.nilIfEmpty ?? "chapter"))
+        let base = sanitizeMarkdownPathSegment(title?.nilIfEmpty ?? ((fallback as NSString).deletingPathExtension.nilIfEmpty ?? "chapter"))
         return String(format: "%03d-%@.md", index, base)
     }
 
@@ -53,6 +53,16 @@ struct OutputWriter {
             .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
             .trimmingCharacters(in: CharacterSet(charactersIn: " .-_"))
         if value.isEmpty { value = "Book" }
+        return value
+    }
+
+    private func sanitizeMarkdownPathSegment(_ input: String) -> String {
+        var value = input
+            .replacingOccurrences(of: "[\\p{C}/\\\\:?%*|\"<>#\\[\\]()]+", with: "-", options: .regularExpression)
+            .replacingOccurrences(of: "\\s+", with: "-", options: .regularExpression)
+            .replacingOccurrences(of: "-+", with: "-", options: .regularExpression)
+            .trimmingCharacters(in: CharacterSet(charactersIn: " .-_"))
+        if value.isEmpty { value = "chapter" }
         return value
     }
 }

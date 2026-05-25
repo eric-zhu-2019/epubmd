@@ -28,3 +28,36 @@ final class HTMLToMarkdownConverterTests: XCTestCase {
         XCTAssertTrue(markdown.contains("![Pic](../assets/"))
     }
 }
+
+extension HTMLToMarkdownConverterTests {
+    func testRemovesDuplicateLeadingChapterTitle() throws {
+        let html = """
+        <html><body><h1 id="chapter7">第零七章 • 计算</h1><p>第零七章 • 计算</p><p>正文开始。</p></body></html>
+        """.data(using: .utf8)!
+        let markdown = try HTMLToMarkdownConverter().convert(data: html, currentEpubPath: "OEBPS/chapter.xhtml", assetMapper: AssetMapper(), chapterLinks: ChapterLinkMap(epubPathToMarkdown: [:]), packageBase: "OEBPS")
+
+        XCTAssertTrue(markdown.contains("# 第零七章 • 计算"))
+        XCTAssertTrue(markdown.contains("正文开始。"))
+        XCTAssertEqual(markdown.components(separatedBy: "第零七章 • 计算").count - 1, 1)
+    }
+
+    func testKeepsHeadingWhenPlainTitlePrecedesDuplicateHeading() throws {
+        let html = """
+        <html><body><p>第零七章 • 计算</p><h1 id="chapter7">第零七章 • 计算</h1><p>正文开始。</p></body></html>
+        """.data(using: .utf8)!
+        let markdown = try HTMLToMarkdownConverter().convert(data: html, currentEpubPath: "OEBPS/chapter.xhtml", assetMapper: AssetMapper(), chapterLinks: ChapterLinkMap(epubPathToMarkdown: [:]), packageBase: "OEBPS")
+
+        XCTAssertTrue(markdown.contains("<a id=\"chapter7\"></a>\n# 第零七章 • 计算"))
+        XCTAssertEqual(markdown.components(separatedBy: "第零七章 • 计算").count - 1, 1)
+    }
+
+    func testKeepsRepeatedLongOpeningParagraphs() throws {
+        let repeated = "This intentionally repeated opening paragraph is longer than a short title and should remain in the converted chapter body for fidelity."
+        let html = """
+        <html><body><p>\(repeated)</p><p>\(repeated)</p><p>Next.</p></body></html>
+        """.data(using: .utf8)!
+        let markdown = try HTMLToMarkdownConverter().convert(data: html, currentEpubPath: "OEBPS/chapter.xhtml", assetMapper: AssetMapper(), chapterLinks: ChapterLinkMap(epubPathToMarkdown: [:]), packageBase: "OEBPS")
+
+        XCTAssertEqual(markdown.components(separatedBy: repeated).count - 1, 2)
+    }
+}

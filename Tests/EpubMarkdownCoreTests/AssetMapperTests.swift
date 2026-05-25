@@ -17,4 +17,19 @@ final class AssetMapperTests: XCTestCase {
         XCTAssertEqual(Set(names).count, 2)
         XCTAssertEqual(mapper.copiedAssets.count, 2)
     }
+
+    func testParentDirectoryImageReferenceResolvesToManifestAsset() throws {
+        let extracted = try TestSupport.makeTempDirectory("parent-assets-src")
+        let output = try TestSupport.makeTempDirectory("parent-assets-out")
+        try TestSupport.write("png", to: extracted.appendingPathComponent("OEBPS/media/resources/title_page.png"))
+        let package = EpubPackage(rootFilePath: "OEBPS/content.opf", baseDirectory: "OEBPS", title: "T", manifest: [
+            "title": ManifestItem(id: "title", href: "media/resources/title_page.png", mediaType: "image/png", absolutePath: "OEBPS/media/resources/title_page.png")
+        ], spine: [])
+
+        var mapper = AssetMapper()
+        try mapper.copyAssets(for: package, extractedRoot: extracted, outputRoot: output)
+
+        let markdownPath = mapper.markdownPath(for: "../media/resources/title_page.png", contentBaseDirectory: "OEBPS/Text")
+        XCTAssertEqual(markdownPath, "../assets/OEBPS-media-resources-title_page.png")
+    }
 }
