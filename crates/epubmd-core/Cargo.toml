@@ -1,0 +1,12 @@
+[package]
+name = "epubmd-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+regex = "1"
+roxmltree = "0.20"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+tempfile = "3"

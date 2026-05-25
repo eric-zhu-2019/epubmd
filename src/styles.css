@@ -110,6 +110,21 @@ button:disabled {
   padding: 3rem 3.5rem;
 }
 
+.chapter-loading {
+  align-items: flex-start;
+  color: #42526e;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  min-height: 12rem;
+  justify-content: center;
+}
+
+.chapter-loading strong {
+  color: #172033;
+  font-size: 1.35rem;
+}
+
 .empty-state,
 .error-state {
   align-items: center;

@@ -28,12 +28,16 @@ type ReaderState = {
   selectedPath?: string;
   error?: string;
   loading: boolean;
+  pendingFragment?: string;
+  renderToken: number;
 };
 
-const state: ReaderState = { loading: false };
+const state: ReaderState = { loading: false, renderToken: 0 };
 const appElement = document.querySelector<HTMLDivElement>('#app');
 if (!appElement) throw new Error('missing #app');
 const app: HTMLDivElement = appElement;
+const renderedChapterCache = new Map<string, string>();
+const assetIndexCache = new WeakMap<BookPayload, Map<string, string>>();
 
 marked.use({
   gfm: true,
@@ -74,9 +78,8 @@ function renderShell(): void {
   });
   document.querySelector<HTMLButtonElement>('#previous-chapter')?.addEventListener('click', () => moveChapter(-1));
   document.querySelector<HTMLButtonElement>('#next-chapter')?.addEventListener('click', () => moveChapter(1));
-  document.querySelectorAll<HTMLAnchorElement>('.book-content a[href]').forEach(anchor => {
-    anchor.addEventListener('click', event => handleReaderLink(event, anchor));
-  });
+  bindReaderLinks();
+  void renderSelectedChapter(book, current);
 }
 
 function readerContent(book: BookPayload | undefined, chapter: BookChapter | undefined): string {
@@ -86,12 +89,12 @@ function readerContent(book: BookPayload | undefined, chapter: BookChapter | und
   if (!book || !chapter) {
     return '<div class="empty-state"><strong>No book loaded</strong><span>Use “Open zip” and choose a zip created by the epubmd CLI.</span></div>';
   }
-  const html = renderMarkdownChapter(book, chapter);
   const index = book.chapters.findIndex(item => item.path === chapter.path);
+  const cached = renderedChapterCache.get(chapterCacheKey(book, chapter));
   return `
     <article class="reader-card">
       <style>${scopeBookCss(book.style_css)}</style>
-      <div class="book-content">${html}</div>
+      <div class="book-content" data-render-chapter="${escapeHtml(chapter.path)}">${cached ?? loadingChapterMarkup(chapter)}</div>
       <div class="reader-nav">
         <button id="previous-chapter" type="button" ${index <= 0 ? 'disabled' : ''}>Previous</button>
         <button id="next-chapter" type="button" ${index >= book.chapters.length - 1 ? 'disabled' : ''}>Next</button>
@@ -100,8 +103,46 @@ function readerContent(book: BookPayload | undefined, chapter: BookChapter | und
   `;
 }
 
-function renderMarkdownChapter(book: BookPayload, chapter: BookChapter): string {
-  const rendered = marked.parse(chapter.markdown, { async: false }) as string;
+async function renderSelectedChapter(book: BookPayload | undefined, chapter: BookChapter | undefined): Promise<void> {
+  if (!book || !chapter) return;
+  const target = document.querySelector<HTMLDivElement>(`.book-content[data-render-chapter="${cssString(chapter.path)}"]`);
+  if (!target) return;
+  const token = ++state.renderToken;
+  const key = chapterCacheKey(book, chapter);
+  const cached = renderedChapterCache.get(key);
+  if (cached) {
+    target.innerHTML = cached;
+    bindReaderLinks(target);
+    scrollPendingFragment();
+    return;
+  }
+
+  target.innerHTML = loadingChapterMarkup(chapter);
+  await nextFrame();
+  if (token !== state.renderToken) return;
+
+  const chunks = splitMarkdownForProgressiveRender(chapter.markdown);
+  const renderedChunks: string[] = [];
+  target.innerHTML = '';
+
+  for (let index = 0; index < chunks.length; index += 1) {
+    await nextFrame();
+    if (token !== state.renderToken) return;
+    const html = renderMarkdownFragment(book, chapter, chunks[index]);
+    renderedChunks.push(html);
+    target.insertAdjacentHTML('beforeend', html);
+    scrollPendingFragment();
+  }
+
+  if (token !== state.renderToken) return;
+  const html = renderedChunks.join('');
+  renderedChapterCache.set(key, html);
+  bindReaderLinks(target);
+  scrollPendingFragment();
+}
+
+function renderMarkdownFragment(book: BookPayload, chapter: BookChapter, markdown: string): string {
+  const rendered = marked.parse(markdown, { async: false }) as string;
   const clean = DOMPurify.sanitize(rendered, {
     ADD_ATTR: ['target'],
   });
@@ -109,8 +150,8 @@ function renderMarkdownChapter(book: BookPayload, chapter: BookChapter): string 
   template.innerHTML = clean;
   template.content.querySelectorAll<HTMLImageElement>('img[src]').forEach(image => {
     const resolved = resolveBookPath(image.getAttribute('src') ?? '', chapter.path);
-    const asset = book.assets.find(candidate => candidate.path === resolved);
-    if (asset) image.setAttribute('src', asset.data_url);
+    const dataUrl = assetIndex(book).get(resolved);
+    if (dataUrl) image.setAttribute('src', dataUrl);
   });
   template.content.querySelectorAll<HTMLAnchorElement>('a[href]').forEach(anchor => {
     const href = anchor.getAttribute('href') ?? '';
@@ -134,8 +175,10 @@ async function openBook(): Promise<void> {
     });
     if (typeof selected !== 'string') return;
     const book = await invoke<BookPayload>('load_book_zip', { path: selected });
+    renderedChapterCache.clear();
     state.book = book;
     state.selectedPath = book.chapters[0]?.path;
+    state.pendingFragment = undefined;
   } catch (error) {
     state.error = error instanceof Error ? error.message : String(error);
   } finally {
@@ -154,6 +197,7 @@ function moveChapter(offset: number): void {
   const next = chapters[index + offset];
   if (!next) return;
   state.selectedPath = next.path;
+  state.pendingFragment = undefined;
   renderShell();
 }
 
@@ -167,10 +211,78 @@ function handleReaderLink(event: MouseEvent, anchor: HTMLAnchorElement): void {
   if (!target) return;
   event.preventDefault();
   state.selectedPath = target.path;
+  state.pendingFragment = fragment;
   renderShell();
-  if (fragment) {
-    requestAnimationFrame(() => document.getElementById(fragment)?.scrollIntoView({ block: 'start' }));
+}
+
+function bindReaderLinks(scope: ParentNode = document): void {
+  const anchors = scope === document
+    ? scope.querySelectorAll<HTMLAnchorElement>('.book-content a[href]')
+    : scope.querySelectorAll<HTMLAnchorElement>('a[href]');
+  anchors.forEach(anchor => {
+    if (anchor.dataset.bound === 'true') return;
+    anchor.dataset.bound = 'true';
+    anchor.addEventListener('click', event => handleReaderLink(event, anchor));
+  });
+}
+
+function splitMarkdownForProgressiveRender(markdown: string): string[] {
+  const maxChunkLength = 60_000;
+  const chunks: string[] = [];
+  const current: string[] = [];
+  let currentLength = 0;
+  let fence: string | undefined;
+
+  for (const line of markdown.split('\n')) {
+    const fenceMatch = line.match(/^(```+|~~~~+)/);
+    if (fenceMatch) {
+      fence = fence ? undefined : fenceMatch[1][0];
+    }
+    current.push(line);
+    currentLength += line.length + 1;
+    if (!fence && currentLength >= maxChunkLength && line.trim() === '') {
+      chunks.push(current.join('\n'));
+      current.length = 0;
+      currentLength = 0;
+    }
   }
+
+  if (current.length > 0) chunks.push(current.join('\n'));
+  return chunks.length > 0 ? chunks : [markdown];
+}
+
+function loadingChapterMarkup(chapter: BookChapter): string {
+  return `
+    <div class="chapter-loading" role="status" aria-live="polite">
+      <strong>${escapeHtml(chapter.title)}</strong>
+      <span>Rendering chapter…</span>
+    </div>
+  `;
+}
+
+function nextFrame(): Promise<void> {
+  return new Promise(resolve => requestAnimationFrame(() => resolve()));
+}
+
+function chapterCacheKey(book: BookPayload, chapter: BookChapter): string {
+  return `${book.title}\u0000${chapter.path}\u0000${chapter.markdown.length}`;
+}
+
+function assetIndex(book: BookPayload): Map<string, string> {
+  const cached = assetIndexCache.get(book);
+  if (cached) return cached;
+  const index = new Map(book.assets.map(asset => [asset.path, asset.data_url]));
+  assetIndexCache.set(book, index);
+  return index;
+}
+
+function scrollPendingFragment(): void {
+  const fragment = state.pendingFragment;
+  if (!fragment) return;
+  const target = document.getElementById(fragment);
+  if (!target) return;
+  target.scrollIntoView({ block: 'start' });
+  state.pendingFragment = undefined;
 }
 
 function resolveBookPath(reference: string, basePath: string): string {
@@ -202,6 +314,10 @@ function escapeHtml(value: string): string {
     '>': '&gt;',
     '"': '&quot;',
   }[character] ?? character));
+}
+
+function cssString(value: string): string {
+  return window.CSS?.escape ? window.CSS.escape(value) : value.replace(/["\\]/g, '\\$&');
 }
 
 renderShell();

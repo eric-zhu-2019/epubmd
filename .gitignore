@@ -6,3 +6,8 @@ node_modules
 dist-web
 src-tauri/target
 output
+
+target
+crates/*/target
+*.epub
+*.pub

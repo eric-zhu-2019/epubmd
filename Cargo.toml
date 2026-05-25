@@ -1,0 +1,7 @@
+[workspace]
+members = [
+  "crates/epubmd-core",
+  "crates/epubmd-cli"
+]
+exclude = ["src-tauri"]
+resolver = "2"

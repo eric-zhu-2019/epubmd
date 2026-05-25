@@ -2,31 +2,37 @@
 
 `epubmd` now has two deliverables:
 
-1. CLI converter: converts a DRM-free EPUB into a Markdown/assets zip.
+1. Rust CLI converter: converts a DRM-free EPUB into a Markdown/assets zip.
 2. Tauri reader app: opens an epubmd-generated zip and renders the Markdown with the zip's `style.css`.
 
 ## Build the CLI converter
 
 ```sh
-xcrun swift build -c release --product epubmd
+cargo build --release -p epubmd
 ```
 
 Run it directly:
 
 ```sh
-.build/release/epubmd book.epub --output book-md.zip
+target/release/epubmd book.epub --output book-md.zip
 ```
 
-Create a distributable CLI archive:
+Create a current-platform CLI archive on macOS, Linux, or Windows:
 
 ```sh
-./script/package_cli.sh
+python3 script/package_cli.py
 ```
 
-Outputs:
+On macOS/Linux, `./script/package_cli.sh` is a convenience wrapper around the same portable Python packager.
 
-- `dist/cli/epubmd`
-- `dist/epubmd-cli-0.1.0.zip`
+Outputs use the current OS/CPU in the filename, for example:
+
+- `dist/cli/epubmd` or `dist/cli/epubmd.exe`
+- `dist/epubmd-cli-0.1.0-darwin-arm64.zip`
+- `dist/epubmd-cli-0.1.0-linux-x86_64.zip`
+- `dist/epubmd-cli-0.1.0-windows-amd64.zip`
+
+For release distribution, run the same Cargo build/package command on each target platform or from CI cross-target jobs.
 
 ## Build the Tauri reader app
 
