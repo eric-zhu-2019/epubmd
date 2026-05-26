@@ -1,10 +1,11 @@
 use base64::{engine::general_purpose, Engine as _};
 use epubmd_core::convert_epub_to_zip;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashMap,
     env,
     fs::{self, File},
-    io::Read,
+    io::{Read, Write},
     path::{Path, PathBuf},
     time::UNIX_EPOCH,
 };
@@ -22,6 +23,7 @@ struct LibraryBook {
     file_name: String,
     title: String,
     chapter_count: usize,
+    progress_chapter_path: Option<String>,
     modified_ms: u64,
 }
 
@@ -66,6 +68,17 @@ struct ThemePayload {
     css: String,
 }
 
+#[derive(Serialize, Deserialize, Clone)]
+struct ReadingProgress {
+    chapter_path: String,
+    updated_ms: u64,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct ReadingProgressStore {
+    books: HashMap<String, ReadingProgress>,
+}
+
 #[tauri::command]
 fn app_paths() -> Result<AppPaths, String> {
     let books_dir = ensure_books_dir()?;
@@ -87,7 +100,7 @@ fn import_epub(path: String) -> Result<ImportPayload, String> {
     require_extension(epub_path, &["epub"], "input file must be an .epub file")?;
     let destination = unique_import_destination(epub_path, &ensure_books_dir()?)?;
     let written = convert_epub_to_zip(epub_path, &destination, false)
-        .map_err(|error| format!("epubmd: {error}"))?;
+        .map_err(|error| format!("goosereader: {error}"))?;
     let book = summarize_book(&written)?;
     let payload = load_book_archive(&written)?;
     Ok(ImportPayload { book, payload })
@@ -116,6 +129,81 @@ fn load_theme_file(path: String) -> Result<ThemePayload, String> {
 #[tauri::command]
 fn load_theme_css(path: String) -> Result<ThemePayload, String> {
     load_theme_css_in_dir(Path::new(&path), &ensure_themes_dir()?)
+}
+
+#[tauri::command]
+fn load_reading_progress(path: String) -> Result<Option<ReadingProgress>, String> {
+    let books_dir = ensure_books_dir()?;
+    load_reading_progress_in_dir(Path::new(&path), &books_dir, &progress_store_path()?)
+}
+
+#[tauri::command]
+fn save_reading_progress(path: String, chapter_path: String) -> Result<(), String> {
+    let books_dir = ensure_books_dir()?;
+    save_reading_progress_in_dir(
+        Path::new(&path),
+        &chapter_path,
+        &books_dir,
+        &progress_store_path()?,
+    )
+}
+
+#[tauri::command]
+fn delete_book(path: String) -> Result<(), String> {
+    let books_dir = ensure_books_dir()?;
+    delete_book_in_dir(Path::new(&path), &books_dir, &progress_store_path()?)
+}
+
+fn load_reading_progress_in_dir(
+    path: &Path,
+    books_dir: &Path,
+    progress_path: &Path,
+) -> Result<Option<ReadingProgress>, String> {
+    let book_path = confined_existing_book(path, books_dir)?;
+    Ok(read_progress_store_from(progress_path)?
+        .books
+        .get(&progress_key(&book_path))
+        .cloned())
+}
+
+fn save_reading_progress_in_dir(
+    path: &Path,
+    chapter_path: &str,
+    books_dir: &Path,
+    progress_path: &Path,
+) -> Result<(), String> {
+    if chapter_path.trim().is_empty() {
+        return Err("chapter path must not be empty".into());
+    }
+    let book_path = confined_existing_book(path, books_dir)?;
+    let mut store = read_progress_store_from(progress_path)?;
+    store.books.insert(
+        progress_key(&book_path),
+        ReadingProgress {
+            chapter_path: chapter_path.to_string(),
+            updated_ms: now_ms(),
+        },
+    );
+    write_progress_store_to(progress_path, &store)
+}
+
+fn delete_book_in_dir(path: &Path, books_dir: &Path, progress_path: &Path) -> Result<(), String> {
+    let book_path = confined_existing_book(path, books_dir)?;
+    let mut store = read_progress_store_from(progress_path).unwrap_or_default();
+    store.books.remove(&progress_key(&book_path));
+    fs::remove_file(&book_path)
+        .map_err(|error| format!("could not delete book {}: {error}", book_path.display()))?;
+    write_progress_store_to(progress_path, &store)
+}
+
+fn confined_existing_book(path: &Path, books_dir: &Path) -> Result<PathBuf, String> {
+    let book_path = confined_existing_file(path, books_dir, "book")?;
+    require_extension(
+        &book_path,
+        &["zmd"],
+        "book file must be a .zmd archive in the library",
+    )?;
+    Ok(book_path)
 }
 
 fn load_book_file_in_dir(path: &Path, books_dir: &Path) -> Result<BookPayload, String> {
@@ -203,7 +291,7 @@ fn load_book_archive(path: &Path) -> Result<BookPayload, String> {
                 .and_then(|stem| stem.to_str())
                 .map(ToOwned::to_owned)
         })
-        .unwrap_or_else(|| "epubmd book".to_string());
+        .unwrap_or_else(|| "goosereader book".to_string());
 
     Ok(BookPayload {
         title,
@@ -215,6 +303,14 @@ fn load_book_archive(path: &Path) -> Result<BookPayload, String> {
 }
 
 fn list_books_in_dir(books_dir: &Path) -> Result<Vec<LibraryBook>, String> {
+    let progress = read_progress_store().unwrap_or_default();
+    list_books_in_dir_with_progress(books_dir, &progress)
+}
+
+fn list_books_in_dir_with_progress(
+    books_dir: &Path,
+    progress: &ReadingProgressStore,
+) -> Result<Vec<LibraryBook>, String> {
     let mut books = Vec::new();
     for entry in fs::read_dir(books_dir)
         .map_err(|error| format!("could not read books directory: {error}"))?
@@ -226,8 +322,15 @@ fn list_books_in_dir(books_dir: &Path) -> Result<Vec<LibraryBook>, String> {
             continue;
         }
         match summarize_book(&path) {
-            Ok(book) => books.push(book),
-            Err(_) => books.push(fallback_library_book(&path)),
+            Ok(mut book) => {
+                book.progress_chapter_path = progress_for_path(&progress, &path);
+                books.push(book);
+            }
+            Err(_) => {
+                let mut book = fallback_library_book(&path);
+                book.progress_chapter_path = progress_for_path(&progress, &path);
+                books.push(book);
+            }
         }
     }
     books.sort_by(|left, right| {
@@ -314,8 +417,59 @@ fn fallback_library_book(path: &Path) -> LibraryBook {
         file_name,
         title,
         chapter_count: 0,
+        progress_chapter_path: None,
         modified_ms: modified_ms(path),
     }
+}
+
+fn read_progress_store() -> Result<ReadingProgressStore, String> {
+    read_progress_store_from(&progress_store_path()?)
+}
+
+fn read_progress_store_from(path: &Path) -> Result<ReadingProgressStore, String> {
+    if !path.exists() {
+        return Ok(ReadingProgressStore::default());
+    }
+    let text = fs::read_to_string(path)
+        .map_err(|error| format!("could not read reading progress: {error}"))?;
+    serde_json::from_str(&text)
+        .map_err(|error| format!("could not parse reading progress: {error}"))
+}
+
+fn write_progress_store_to(path: &Path, store: &ReadingProgressStore) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "could not create reading progress directory {}: {error}",
+                parent.display()
+            )
+        })?;
+    }
+    let mut file =
+        File::create(path).map_err(|error| format!("could not write reading progress: {error}"))?;
+    serde_json::to_writer_pretty(&mut file, store)
+        .map_err(|error| format!("could not serialize reading progress: {error}"))?;
+    file.write_all(b"\n")
+        .map_err(|error| format!("could not finish reading progress: {error}"))
+}
+
+fn progress_store_path() -> Result<PathBuf, String> {
+    Ok(config_root()?.join("reading-progress.json"))
+}
+
+fn progress_for_path(store: &ReadingProgressStore, path: &Path) -> Option<String> {
+    let key = path
+        .canonicalize()
+        .map(|path| progress_key(&path))
+        .unwrap_or_else(|_| progress_key(path));
+    store
+        .books
+        .get(&key)
+        .map(|progress| progress.chapter_path.clone())
+}
+
+fn progress_key(path: &Path) -> String {
+    display_path(path)
 }
 
 fn unique_import_destination(epub_path: &Path, books_dir: &Path) -> Result<PathBuf, String> {
@@ -370,13 +524,13 @@ fn ensure_dir(path: PathBuf) -> Result<PathBuf, String> {
 }
 
 fn config_root() -> Result<PathBuf, String> {
-    if let Some(path) = env::var_os("EPUBMD_CONFIG_DIR") {
+    if let Some(path) = env::var_os("GOOSEREADER_CONFIG_DIR") {
         return Ok(PathBuf::from(path));
     }
     let home = env::var_os("HOME")
         .or_else(|| env::var_os("USERPROFILE"))
-        .ok_or_else(|| "could not locate home directory for ~/.config/epubmd".to_string())?;
-    Ok(PathBuf::from(home).join(".config").join("epubmd"))
+        .ok_or_else(|| "could not locate home directory for ~/.config/goosereader".to_string())?;
+    Ok(PathBuf::from(home).join(".config").join("goosereader"))
 }
 
 fn title_from_readme(readme: &str) -> Option<String> {
@@ -524,6 +678,14 @@ fn modified_ms(path: &Path) -> u64 {
     u64::try_from(millis).unwrap_or(u64::MAX)
 }
 
+fn now_ms() -> u64 {
+    let millis = UNIX_EPOCH
+        .elapsed()
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default();
+    u64::try_from(millis).unwrap_or(u64::MAX)
+}
+
 fn display_path(path: &Path) -> String {
     path.to_string_lossy().to_string()
 }
@@ -537,10 +699,13 @@ pub fn run() {
             import_epub,
             list_books,
             list_themes,
+            load_reading_progress,
             load_book_file,
             load_book_zip,
             load_theme_css,
-            load_theme_file
+            load_theme_file,
+            save_reading_progress,
+            delete_book
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -549,8 +714,10 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        list_books_in_dir, list_themes_in_dir, load_book_archive, load_book_file_in_dir,
-        load_theme_css_in_dir, order_chapters_from_readme, unique_import_destination, BookChapter,
+        delete_book_in_dir, list_books_in_dir, list_books_in_dir_with_progress, list_themes_in_dir,
+        load_book_archive, load_book_file_in_dir, load_reading_progress_in_dir,
+        load_theme_css_in_dir, order_chapters_from_readme, read_progress_store_from,
+        save_reading_progress_in_dir, unique_import_destination, BookChapter,
     };
     use std::{fs::File, io::Write};
     use zip::{write::SimpleFileOptions, ZipWriter};
@@ -558,7 +725,7 @@ mod tests {
     #[test]
     fn loads_epubmd_zip_payload() {
         let path =
-            std::env::temp_dir().join(format!("epubmd-reader-test-{}.zip", std::process::id()));
+            std::env::temp_dir().join(format!("goosereader-test-{}.zip", std::process::id()));
         write_test_book(&path);
 
         let payload = load_book_archive(&path).expect("load book");
@@ -576,7 +743,7 @@ mod tests {
     #[test]
     fn loads_zmd_payload() {
         let path =
-            std::env::temp_dir().join(format!("epubmd-reader-test-{}.zmd", std::process::id()));
+            std::env::temp_dir().join(format!("goosereader-test-{}.zmd", std::process::id()));
         write_test_book(&path);
 
         let root = path.parent().unwrap();
@@ -614,7 +781,8 @@ mod tests {
 
     #[test]
     fn lists_zmd_books_and_css_themes_from_app_dirs() {
-        let root = std::env::temp_dir().join(format!("epubmd-library-test-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("goosereader-library-test-{}", std::process::id()));
         let books_dir = root.join("books");
         let themes_dir = root.join("themes");
         std::fs::create_dir_all(&books_dir).expect("create books dir");
@@ -641,7 +809,8 @@ mod tests {
 
     #[test]
     fn book_and_theme_loaders_reject_paths_outside_app_dirs() {
-        let root = std::env::temp_dir().join(format!("epubmd-confine-test-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("goosereader-confine-test-{}", std::process::id()));
         let books_dir = root.join("books");
         let themes_dir = root.join("themes");
         let outside_dir = root.join("outside");
@@ -667,7 +836,8 @@ mod tests {
 
     #[test]
     fn import_destination_uses_zmd_and_avoids_overwrite() {
-        let root = std::env::temp_dir().join(format!("epubmd-import-test-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("goosereader-import-test-{}", std::process::id()));
         std::fs::create_dir_all(&root).expect("create root");
         let source = root.join("My Book!.epub");
         std::fs::write(&source, b"not a real epub").expect("write source");
@@ -682,7 +852,7 @@ mod tests {
     #[test]
     fn loads_theme_css_file() {
         let path =
-            std::env::temp_dir().join(format!("epubmd-theme-test-{}.css", std::process::id()));
+            std::env::temp_dir().join(format!("goosereader-theme-test-{}.css", std::process::id()));
         std::fs::write(&path, "#write { font-family: serif; }").expect("write theme");
 
         let root = path.parent().unwrap();
@@ -692,6 +862,67 @@ mod tests {
         assert!(theme.css.contains("#write"));
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn saves_loads_and_deletes_book_progress() {
+        let root =
+            std::env::temp_dir().join(format!("goosereader-progress-test-{}", std::process::id()));
+        let books_dir = root.join("books");
+        let progress_path = root.join("reading-progress.json");
+        std::fs::create_dir_all(&books_dir).expect("create books dir");
+        let book_path = books_dir.join("book.zmd");
+        write_test_book(&book_path);
+
+        save_reading_progress_in_dir(
+            &book_path,
+            "chapters/001-One.md",
+            &books_dir,
+            &progress_path,
+        )
+        .expect("save progress");
+        let progress = load_reading_progress_in_dir(&book_path, &books_dir, &progress_path)
+            .expect("load progress")
+            .expect("progress exists");
+        assert_eq!(progress.chapter_path, "chapters/001-One.md");
+
+        let progress_store = read_progress_store_from(&progress_path).expect("read progress store");
+        let books =
+            list_books_in_dir_with_progress(&books_dir, &progress_store).expect("list books");
+        assert_eq!(
+            books[0].progress_chapter_path.as_deref(),
+            Some("chapters/001-One.md")
+        );
+
+        delete_book_in_dir(&book_path, &books_dir, &progress_path).expect("delete book");
+
+        assert!(!book_path.exists());
+        let store = read_progress_store_from(&progress_path).expect("read progress store");
+        assert!(store.books.is_empty());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn delete_book_tolerates_corrupt_progress_store() {
+        let root = std::env::temp_dir().join(format!(
+            "goosereader-corrupt-progress-test-{}",
+            std::process::id()
+        ));
+        let books_dir = root.join("books");
+        let progress_path = root.join("reading-progress.json");
+        std::fs::create_dir_all(&books_dir).expect("create books dir");
+        let book_path = books_dir.join("book.zmd");
+        write_test_book(&book_path);
+        std::fs::write(&progress_path, "{not json").expect("write corrupt progress");
+
+        delete_book_in_dir(&book_path, &books_dir, &progress_path).expect("delete book");
+
+        assert!(!book_path.exists());
+        let store = read_progress_store_from(&progress_path).expect("read repaired progress");
+        assert!(store.books.is_empty());
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     fn write_test_book(path: &std::path::Path) {

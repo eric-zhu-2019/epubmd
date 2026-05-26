@@ -802,20 +802,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "epubmd-reader"
-version = "0.1.0"
-dependencies = [
- "base64 0.22.1",
- "epubmd-core",
- "mime_guess",
- "serde",
- "tauri",
- "tauri-build",
- "tauri-plugin-dialog",
- "zip",
-]
-
-[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1239,6 +1225,21 @@ dependencies = [
  "glib-sys",
  "libc",
  "system-deps",
+]
+
+[[package]]
+name = "goosereader"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "epubmd-core",
+ "mime_guess",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-dialog",
+ "zip",
 ]
 
 [[package]]

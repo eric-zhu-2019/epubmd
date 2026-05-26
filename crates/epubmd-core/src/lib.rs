@@ -60,6 +60,7 @@ struct EpubPackage {
     manifest: HashMap<String, ManifestItem>,
     spine: Vec<SpineItem>,
     metadata: Metadata,
+    nav_points: Vec<NavPoint>,
 }
 
 #[derive(Debug, Clone)]
@@ -68,6 +69,28 @@ struct ChapterData {
     data: Vec<u8>,
     file_name: String,
     title: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct NavPoint {
+    title: String,
+    epub_path: String,
+    fragment: Option<String>,
+    depth: usize,
+}
+
+#[derive(Debug, Clone)]
+struct NavTarget {
+    spine_index: usize,
+    fragment: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct LogicalChapterSegment {
+    title: String,
+    file_name: String,
+    nav_index: usize,
+    start: NavTarget,
 }
 
 #[derive(Debug, Clone)]
@@ -199,6 +222,12 @@ impl ChapterLinkMap {
         }
         let base = parent_dir(current_epub_path);
         let normalized = normalize_path(&join_path(&base, &target_no_fragment));
+        if let Some(fragment) = fragment.as_deref() {
+            let exact = format!("{normalized}#{fragment}");
+            if let Some(markdown) = self.epub_path_to_markdown.get(&exact) {
+                return Some(markdown.clone());
+            }
+        }
         let markdown = self.epub_path_to_markdown.get(&normalized)?;
         Some(match fragment {
             Some(fragment) => format!("{markdown}#{fragment}"),
@@ -243,7 +272,6 @@ pub fn convert_epub_to_zip(
     let package = parse_package(&entries)?;
 
     let mut chapters = Vec::new();
-    let mut chapter_output_by_epub_path = HashMap::new();
     for (offset, spine_item) in package.spine.iter().enumerate() {
         let data = entries
             .get(&spine_item.item.absolute_path)
@@ -256,8 +284,6 @@ pub fn convert_epub_to_zip(
             .clone();
         let title = chapter_title(&data);
         let file_name = chapter_file_name(offset + 1, title.as_deref(), &spine_item.item.href);
-        chapter_output_by_epub_path
-            .insert(spine_item.item.absolute_path.clone(), file_name.clone());
         chapters.push(ChapterData {
             item: spine_item.item.clone(),
             data,
@@ -265,6 +291,7 @@ pub fn convert_epub_to_zip(
             title,
         });
     }
+    let logical_segments = logical_chapter_segments(&chapters, &package.nav_points);
 
     let mut asset_mapper = AssetMapper::default();
     asset_mapper.copy_assets_from_manifest(&package, &entries);
@@ -278,9 +305,13 @@ pub fn convert_epub_to_zip(
     }
 
     let chapter_links = ChapterLinkMap {
-        epub_path_to_markdown: chapter_output_by_epub_path,
+        epub_path_to_markdown: chapter_output_map(
+            &chapters,
+            &package.nav_points,
+            &logical_segments,
+        ),
     };
-    let mut output_chapters = Vec::new();
+    let mut converted_spines = Vec::new();
     for chapter in &chapters {
         let markdown = convert_xhtml_to_markdown(
             &chapter.data,
@@ -288,15 +319,15 @@ pub fn convert_epub_to_zip(
             &asset_mapper,
             &chapter_links,
         )?;
-        output_chapters.push((
-            chapter.file_name.clone(),
-            chapter
-                .title
-                .clone()
-                .unwrap_or_else(|| fallback_chapter_title(&chapter.file_name)),
+        let markdown = promote_navigation_targets_to_headings(
             markdown,
-        ));
+            &chapter.item.absolute_path,
+            &package.nav_points,
+        );
+        converted_spines.push(markdown);
     }
+    let output_chapters =
+        output_chapters_from_spines(&chapters, &converted_spines, &logical_segments);
 
     let file = File::create(&destination)
         .map_err(|error| ConversionError::FileSystem(format!("could not create zip: {error}")))?;
@@ -465,11 +496,14 @@ fn parse_package(entries: &HashMap<String, Vec<u8>>) -> Result<EpubPackage, Conv
         ));
     }
 
+    let nav_points = parse_navigation_points(entries, &manifest, &opf_doc, &base_directory);
+
     Ok(EpubPackage {
         title,
         manifest,
         spine,
         metadata,
+        nav_points,
     })
 }
 
@@ -491,6 +525,237 @@ fn parse_metadata(doc: &Document<'_>, fallback_title: &str) -> Metadata {
         publisher: first_descendant_text(scope, "publisher"),
         date: first_descendant_text(scope, "date"),
         identifier: first_descendant_text(scope, "identifier"),
+    }
+}
+
+fn parse_navigation_points(
+    entries: &HashMap<String, Vec<u8>>,
+    manifest: &HashMap<String, ManifestItem>,
+    opf_doc: &Document<'_>,
+    opf_base_directory: &str,
+) -> Vec<NavPoint> {
+    let mut nav_items = Vec::new();
+    let mut explicit_toc_items = Vec::new();
+    let mut fallback_ncx_items = Vec::new();
+    if let Some(toc_id) = opf_doc
+        .descendants()
+        .find(|node| node.is_element() && node.tag_name().name() == "spine")
+        .and_then(|node| node.attribute("toc"))
+    {
+        if let Some(item) = manifest.get(toc_id) {
+            explicit_toc_items.push(item.clone());
+        }
+    }
+    for item in manifest.values() {
+        let media_type = item.media_type.to_lowercase();
+        let properties = manifest_item_properties(item, opf_doc);
+        let is_ncx = media_type.contains("ncx") || item.href.to_lowercase().ends_with(".ncx");
+        let is_nav = properties
+            .split_whitespace()
+            .any(|property| property == "nav");
+        if is_nav {
+            nav_items.push(item.clone());
+        } else if is_ncx
+            && !explicit_toc_items
+                .iter()
+                .any(|existing| existing.absolute_path == item.absolute_path)
+        {
+            fallback_ncx_items.push(item.clone());
+        }
+    }
+
+    for items in [
+        &nav_items[..],
+        &explicit_toc_items[..],
+        &fallback_ncx_items[..],
+    ] {
+        let points = navigation_points_from_items(entries, items);
+        if !points.is_empty() {
+            return points;
+        }
+    }
+
+    parse_inline_navigation_hrefs(opf_doc, opf_base_directory)
+}
+
+fn navigation_points_from_items(
+    entries: &HashMap<String, Vec<u8>>,
+    navigation_items: &[ManifestItem],
+) -> Vec<NavPoint> {
+    let mut points = Vec::new();
+    let mut seen_targets = HashSet::new();
+    for item in navigation_items {
+        let Some(bytes) = entries.get(&item.absolute_path) else {
+            continue;
+        };
+        let Ok(text) = std::str::from_utf8(bytes) else {
+            continue;
+        };
+        let item_base = parent_dir(&item.absolute_path);
+        let parsed = if item.media_type.to_lowercase().contains("ncx")
+            || item.href.to_lowercase().ends_with(".ncx")
+        {
+            parse_ncx_points(text, &item_base)
+        } else {
+            parse_xhtml_nav_points(text, &item_base)
+        };
+        for point in parsed {
+            let key = (point.epub_path.clone(), point.fragment.clone());
+            if seen_targets.insert(key) {
+                points.push(point);
+            }
+        }
+    }
+    points
+}
+
+fn manifest_item_properties(item: &ManifestItem, opf_doc: &Document<'_>) -> String {
+    opf_doc
+        .descendants()
+        .find(|node| {
+            node.is_element()
+                && node.tag_name().name() == "item"
+                && node.attribute("href") == Some(item.href.as_str())
+        })
+        .and_then(|node| node.attribute("properties"))
+        .unwrap_or("")
+        .to_lowercase()
+}
+
+fn parse_ncx_points(text: &str, base_directory: &str) -> Vec<NavPoint> {
+    let Ok(doc) = Document::parse(text) else {
+        return Vec::new();
+    };
+    let Some(nav_map) = doc
+        .descendants()
+        .find(|node| node.is_element() && node.tag_name().name() == "navMap")
+    else {
+        return Vec::new();
+    };
+    let mut points = Vec::new();
+    for node in nav_map
+        .children()
+        .filter(|node| node.is_element() && node.tag_name().name() == "navPoint")
+    {
+        collect_ncx_point(node, base_directory, 1, &mut points);
+    }
+    points
+}
+
+fn collect_ncx_point(
+    node: Node<'_, '_>,
+    base_directory: &str,
+    depth: usize,
+    points: &mut Vec<NavPoint>,
+) {
+    let title = node
+        .children()
+        .find(|child| child.is_element() && child.tag_name().name() == "navLabel")
+        .and_then(|label| {
+            label
+                .descendants()
+                .find(|descendant| {
+                    descendant.is_element() && descendant.tag_name().name() == "text"
+                })
+                .and_then(collapsed_text)
+                .or_else(|| collapsed_text(label))
+        });
+    let source = node
+        .children()
+        .find(|child| child.is_element() && child.tag_name().name() == "content")
+        .and_then(|content| content.attribute("src"));
+    if let (Some(title), Some(source)) = (title, source) {
+        points.push(nav_point_from_href(title, source, base_directory, depth));
+    }
+    for child in node
+        .children()
+        .filter(|child| child.is_element() && child.tag_name().name() == "navPoint")
+    {
+        collect_ncx_point(child, base_directory, depth + 1, points);
+    }
+}
+
+fn parse_xhtml_nav_points(text: &str, base_directory: &str) -> Vec<NavPoint> {
+    let content = strip_doctype(text);
+    let Ok(doc) = Document::parse(&content) else {
+        return Vec::new();
+    };
+    let nav = doc
+        .descendants()
+        .find(|node| node.is_element() && node.tag_name().name() == "nav" && is_toc_nav(*node))
+        .or_else(|| {
+            doc.descendants()
+                .find(|node| node.is_element() && node.tag_name().name() == "nav")
+        })
+        .unwrap_or_else(|| doc.root_element());
+    let mut points = Vec::new();
+    for list in nav
+        .children()
+        .filter(|child| child.is_element() && matches!(child.tag_name().name(), "ol" | "ul"))
+    {
+        collect_xhtml_nav_list(list, base_directory, 1, &mut points);
+    }
+    points
+}
+
+fn is_toc_nav(node: Node<'_, '_>) -> bool {
+    node.attributes().any(|attribute| {
+        let name = attribute.name();
+        matches!(name, "type" | "epub:type")
+            && attribute
+                .value()
+                .split_whitespace()
+                .any(|value| value.eq_ignore_ascii_case("toc"))
+    })
+}
+
+fn collect_xhtml_nav_list(
+    list: Node<'_, '_>,
+    base_directory: &str,
+    depth: usize,
+    points: &mut Vec<NavPoint>,
+) {
+    for item in list
+        .children()
+        .filter(|child| child.is_element() && child.tag_name().name() == "li")
+    {
+        if let Some(link) = item
+            .children()
+            .find(|child| child.is_element() && child.tag_name().name() == "a")
+        {
+            if let Some(href) = link.attribute("href") {
+                if let Some(title) = collapsed_text(link) {
+                    points.push(nav_point_from_href(title, href, base_directory, depth));
+                }
+            }
+        }
+        for child_list in item
+            .children()
+            .filter(|child| child.is_element() && matches!(child.tag_name().name(), "ol" | "ul"))
+        {
+            collect_xhtml_nav_list(child_list, base_directory, depth + 1, points);
+        }
+    }
+}
+
+fn parse_inline_navigation_hrefs(doc: &Document<'_>, base_directory: &str) -> Vec<NavPoint> {
+    doc.descendants()
+        .filter(|node| node.is_element() && node.tag_name().name() == "a")
+        .filter_map(|link| {
+            let href = link.attribute("href")?;
+            let title = collapsed_text(link)?;
+            Some(nav_point_from_href(title, href, base_directory, 1))
+        })
+        .collect()
+}
+
+fn nav_point_from_href(title: String, href: &str, base_directory: &str, depth: usize) -> NavPoint {
+    let no_fragment = remove_fragment(href);
+    NavPoint {
+        title: trim_inline(&title),
+        epub_path: normalize_path(&join_path(base_directory, &no_fragment)),
+        fragment: fragment(href),
+        depth,
     }
 }
 
@@ -566,6 +831,11 @@ fn render_block(node: Node<'_, '_>, context: &RenderContext<'_>) -> String {
         ),
         "hr" => "---".to_string(),
         "table" => format!("{}{}", anchor_prefix(node), render_table(node, context)),
+        "nav" => format!(
+            "{}{}",
+            anchor_prefix(node),
+            render_navigation(node, context)
+        ),
         "figure" => format!(
             "{}{}",
             anchor_prefix(node),
@@ -579,7 +849,7 @@ fn render_block(node: Node<'_, '_>, context: &RenderContext<'_>) -> String {
         "figcaption" => {
             format!("_{}_", trim_inline(&render_inline_children(node, context)))
         }
-        "div" | "section" | "article" | "main" | "body" | "html" | "aside" | "nav" => format!(
+        "div" | "section" | "article" | "main" | "body" | "html" | "aside" => format!(
             "{}{}",
             anchor_prefix(node),
             render_mixed_block_contents(node, context)
@@ -683,28 +953,32 @@ fn render_inline_children(node: Node<'_, '_>, context: &RenderContext<'_>) -> St
 }
 
 fn render_inline(node: Node<'_, '_>, context: &RenderContext<'_>) -> String {
+    let anchor = anchor_prefix(node);
     match node.tag_name().name() {
         "strong" | "b" => format!(
-            "**{}**",
+            "{anchor}**{}**",
             trim_inline(&render_inline_children(node, context))
         ),
-        "em" | "i" => format!("*{}*", trim_inline(&render_inline_children(node, context))),
+        "em" | "i" => format!(
+            "{anchor}*{}*",
+            trim_inline(&render_inline_children(node, context))
+        ),
         "code" => format!(
-            "`{}`",
+            "{anchor}`{}`",
             trim_inline(&render_inline_children(node, context)).replace('`', "\\`")
         ),
         "sup" => format!(
-            "<sup>{}</sup>",
+            "{anchor}<sup>{}</sup>",
             trim_inline(&render_inline_children(node, context))
         ),
         "sub" => format!(
-            "<sub>{}</sub>",
+            "{anchor}<sub>{}</sub>",
             trim_inline(&render_inline_children(node, context))
         ),
         "a" => {
             let text = trim_inline(&render_inline_children(node, context));
             let Some(href) = node.attribute("href").filter(|href| !href.is_empty()) else {
-                return text;
+                return format!("{anchor}{text}");
             };
             let resolved = context
                 .chapter_links
@@ -715,13 +989,70 @@ fn render_inline(node: Node<'_, '_>, context: &RenderContext<'_>) -> String {
             } else {
                 text
             };
-            format!("[{label}]({resolved})")
+            format!("{anchor}[{label}]({resolved})")
         }
-        "img" => render_image(node, context),
-        "br" => "\n".to_string(),
-        "li" | "ul" | "ol" => render_block(node, context),
-        _ => render_inline_children(node, context),
+        "img" => format!("{anchor}{}", render_image(node, context)),
+        "br" => format!("{anchor}\n"),
+        "li" | "ul" | "ol" => format!("{anchor}{}", render_block(node, context)),
+        _ => format!("{anchor}{}", render_inline_children(node, context)),
     }
+}
+
+fn render_navigation(node: Node<'_, '_>, context: &RenderContext<'_>) -> String {
+    let rendered = render_mixed_block_contents(node, context);
+    if node.descendants().any(|descendant| {
+        descendant.is_element() && matches!(descendant.tag_name().name(), "ol" | "ul")
+    }) {
+        return rendered;
+    }
+
+    let links = node
+        .descendants()
+        .filter(|descendant| descendant.is_element() && descendant.tag_name().name() == "a")
+        .filter_map(|link| render_nav_link(link, context))
+        .collect::<Vec<_>>();
+    if links.len() < 2 {
+        return rendered;
+    }
+
+    let mut blocks = Vec::new();
+    if let Some(heading) = node.descendants().find(|descendant| {
+        descendant.is_element()
+            && matches!(
+                descendant.tag_name().name(),
+                "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
+            )
+    }) {
+        let heading_text = trim_inline(&render_inline_children(heading, context));
+        if !heading_text.is_empty() {
+            let level = heading.tag_name().name()[1..]
+                .parse::<usize>()
+                .unwrap_or(2)
+                .max(2);
+            blocks.push(format!("{} {heading_text}", "#".repeat(level)));
+        }
+    }
+    blocks.push(
+        links
+            .into_iter()
+            .map(|link| format!("- {link}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+    blocks.join("\n\n")
+}
+
+fn render_nav_link(node: Node<'_, '_>, context: &RenderContext<'_>) -> Option<String> {
+    let href = node.attribute("href").filter(|href| !href.is_empty())?;
+    let text = trim_inline(&render_inline_children(node, context));
+    if text.is_empty() {
+        return None;
+    }
+    let resolved = context
+        .chapter_links
+        .markdown_path(href, context.current_epub_path)
+        .unwrap_or_else(|| href.to_string());
+    Some(format!("[{text}]({resolved})"))
 }
 
 fn render_table(node: Node<'_, '_>, context: &RenderContext<'_>) -> String {
@@ -823,6 +1154,429 @@ fn chapter_title(data: &[u8]) -> Option<String> {
     doc.descendants()
         .find(|node| node.is_element() && node.tag_name().name() == "title")
         .and_then(collapsed_text)
+}
+
+fn logical_chapter_segments(
+    chapters: &[ChapterData],
+    nav_points: &[NavPoint],
+) -> Vec<LogicalChapterSegment> {
+    if nav_points.is_empty() {
+        return Vec::new();
+    }
+    let spine_index_by_path = chapters
+        .iter()
+        .enumerate()
+        .map(|(index, chapter)| (chapter.item.absolute_path.clone(), index))
+        .collect::<HashMap<_, _>>();
+    let max_depth = nav_points
+        .iter()
+        .map(|point| point.depth)
+        .max()
+        .unwrap_or(1);
+    let mut used_names = HashSet::new();
+    let mut segments = Vec::new();
+    for (nav_index, point) in nav_points.iter().enumerate() {
+        let Some(spine_index) = spine_index_by_path.get(&point.epub_path).copied() else {
+            continue;
+        };
+        let split_here = if max_depth > 1 {
+            point.depth == 1
+        } else {
+            is_likely_logical_chapter_title(&point.title)
+        };
+        if !split_here {
+            continue;
+        }
+        let mut file_name =
+            chapter_file_name(segments.len() + 1, Some(&point.title), &point.epub_path);
+        if used_names.contains(&file_name) {
+            let base = file_name.trim_end_matches(".md").to_string();
+            let mut suffix = 2;
+            while used_names.contains(&file_name) {
+                file_name = format!("{base}-{suffix}.md");
+                suffix += 1;
+            }
+        }
+        used_names.insert(file_name.clone());
+        segments.push(LogicalChapterSegment {
+            title: point.title.clone(),
+            file_name,
+            nav_index,
+            start: NavTarget {
+                spine_index,
+                fragment: point.fragment.clone(),
+            },
+        });
+    }
+    if segments.len() < 2 {
+        Vec::new()
+    } else {
+        segments
+    }
+}
+
+fn is_likely_logical_chapter_title(title: &str) -> bool {
+    let title = trim_inline(title).replace('\u{3000}', " ");
+    if title.is_empty() {
+        return false;
+    }
+    let subsection_re = Regex::new(r"^\d+(?:\.\d+)+\s+").expect("valid regex");
+    if subsection_re.is_match(&title) {
+        return false;
+    }
+    let numbered_chapter_re = Regex::new(r"^\d+\s+\S").expect("valid regex");
+    let cjk_chapter_re =
+        Regex::new(r"^第[一二三四五六七八九十百千万\d]+[章节部分卷篇]").expect("valid regex");
+    let named_chapter_re = Regex::new(
+        r"^(附录|Appendix|Preface|Introduction|Foreword|Afterword|Part|Chapter|序言|前言|引言|作者介绍|后记|参考)",
+    )
+    .expect("valid regex");
+    numbered_chapter_re.is_match(&title)
+        || cjk_chapter_re.is_match(&title)
+        || named_chapter_re.is_match(&title)
+}
+
+fn chapter_output_map(
+    chapters: &[ChapterData],
+    nav_points: &[NavPoint],
+    segments: &[LogicalChapterSegment],
+) -> HashMap<String, String> {
+    if segments.is_empty() {
+        return chapters
+            .iter()
+            .map(|chapter| {
+                (
+                    chapter.item.absolute_path.clone(),
+                    chapter.file_name.clone(),
+                )
+            })
+            .collect();
+    }
+    let mut output = HashMap::new();
+    for (spine_index, chapter) in chapters.iter().enumerate() {
+        if let Some(segment) = segment_for_spine_start(spine_index, segments) {
+            output.insert(
+                chapter.item.absolute_path.clone(),
+                segment.file_name.clone(),
+            );
+        }
+    }
+    for (nav_index, point) in nav_points.iter().enumerate() {
+        let Some(segment) = segment_for_nav_index(nav_index, segments) else {
+            continue;
+        };
+        if let Some(fragment) = &point.fragment {
+            output.insert(
+                format!("{}#{fragment}", point.epub_path),
+                format!("{}#{fragment}", segment.file_name),
+            );
+        } else {
+            output.insert(point.epub_path.clone(), segment.file_name.clone());
+        }
+    }
+    insert_fragment_output_paths(chapters, segments, &mut output);
+    output
+}
+
+fn insert_fragment_output_paths(
+    chapters: &[ChapterData],
+    segments: &[LogicalChapterSegment],
+    output: &mut HashMap<String, String>,
+) {
+    for (spine_index, chapter) in chapters.iter().enumerate() {
+        let anchors = xhtml_anchor_ids(&chapter.data);
+        if anchors.is_empty() {
+            continue;
+        }
+        let anchor_position_by_id = anchors
+            .iter()
+            .enumerate()
+            .map(|(index, anchor)| (anchor.clone(), index))
+            .collect::<HashMap<_, _>>();
+        let mut segment_positions = segments
+            .iter()
+            .filter(|segment| segment.start.spine_index == spine_index)
+            .filter_map(|segment| {
+                let position = segment
+                    .start
+                    .fragment
+                    .as_ref()
+                    .and_then(|fragment| anchor_position_by_id.get(fragment))
+                    .copied()
+                    .unwrap_or(0);
+                Some((position, segment))
+            })
+            .collect::<Vec<_>>();
+        segment_positions.sort_by_key(|(position, segment)| (*position, segment.nav_index));
+
+        for (anchor_index, anchor) in anchors.iter().enumerate() {
+            let segment = segment_positions
+                .iter()
+                .take_while(|(position, _)| *position <= anchor_index)
+                .map(|(_, segment)| *segment)
+                .last()
+                .or_else(|| previous_segment_before_spine(spine_index, segments))
+                .or_else(|| segments.first());
+            let Some(segment) = segment else {
+                continue;
+            };
+            output.insert(
+                format!("{}#{anchor}", chapter.item.absolute_path),
+                format!("{}#{anchor}", segment.file_name),
+            );
+        }
+    }
+}
+
+fn previous_segment_before_spine(
+    spine_index: usize,
+    segments: &[LogicalChapterSegment],
+) -> Option<&LogicalChapterSegment> {
+    segments
+        .iter()
+        .take_while(|segment| segment.start.spine_index < spine_index)
+        .last()
+}
+
+fn xhtml_anchor_ids(data: &[u8]) -> Vec<String> {
+    let Ok(text) = std::str::from_utf8(data) else {
+        return Vec::new();
+    };
+    let content = strip_doctype(text);
+    let Ok(doc) = Document::parse(&content) else {
+        return Vec::new();
+    };
+    let mut ids = Vec::new();
+    let mut seen = HashSet::new();
+    for node in doc.descendants().filter(|node| node.is_element()) {
+        let Some(id) = node
+            .attribute("id")
+            .or_else(|| node.attribute("name"))
+            .filter(|value| !value.trim().is_empty())
+        else {
+            continue;
+        };
+        if seen.insert(id.to_string()) {
+            ids.push(id.to_string());
+        }
+    }
+    ids
+}
+
+fn segment_for_spine_start<'a>(
+    spine_index: usize,
+    segments: &'a [LogicalChapterSegment],
+) -> Option<&'a LogicalChapterSegment> {
+    segments
+        .iter()
+        .take_while(|segment| segment.start.spine_index <= spine_index)
+        .last()
+        .or_else(|| segments.first())
+}
+
+fn segment_for_nav_index(
+    nav_index: usize,
+    segments: &[LogicalChapterSegment],
+) -> Option<&LogicalChapterSegment> {
+    segments
+        .iter()
+        .take_while(|segment| segment.nav_index <= nav_index)
+        .last()
+        .or_else(|| segments.first())
+}
+
+fn promote_navigation_targets_to_headings(
+    mut markdown: String,
+    epub_path: &str,
+    nav_points: &[NavPoint],
+) -> String {
+    let max_depth = nav_points
+        .iter()
+        .map(|point| point.depth)
+        .max()
+        .unwrap_or(1);
+    let mut seen_fragments = HashSet::new();
+    for point in nav_points
+        .iter()
+        .filter(|point| point.epub_path == epub_path)
+    {
+        let level = if max_depth > 1 {
+            point.depth
+        } else if is_likely_logical_chapter_title(&point.title) {
+            1
+        } else {
+            2
+        };
+        if let Some(fragment) = point.fragment.as_deref() {
+            if !seen_fragments.insert(fragment.to_string()) {
+                continue;
+            }
+            markdown =
+                promote_anchor_to_heading(&markdown, fragment, &point.title, level.clamp(1, 6));
+        } else if seen_fragments.insert(String::new()) {
+            markdown = promote_start_to_heading(&markdown, &point.title, level.clamp(1, 6));
+        }
+    }
+    markdown
+}
+
+fn promote_anchor_to_heading(markdown: &str, fragment: &str, title: &str, level: usize) -> String {
+    let marker = format!(r#"<a id="{fragment}"></a>"#);
+    let Some(marker_start) = markdown.find(&marker) else {
+        return markdown.to_string();
+    };
+    let marker_end = marker_start + marker.len();
+    let mut content_start = marker_end;
+    while markdown[content_start..].starts_with('\n') || markdown[content_start..].starts_with(' ')
+    {
+        content_start += 1;
+        if content_start >= markdown.len() {
+            break;
+        }
+    }
+    let heading = format!("{} {}", "#".repeat(level), trim_inline(title));
+    if content_start >= markdown.len() {
+        return format!("{markdown}\n\n{heading}");
+    }
+    let content_end = markdown[content_start..]
+        .find("\n\n")
+        .map(|offset| content_start + offset)
+        .unwrap_or(markdown.len());
+    let existing_block = markdown[content_start..content_end].trim();
+    if existing_block.starts_with('#') {
+        return markdown.to_string();
+    }
+    let mut output = String::new();
+    output.push_str(&markdown[..marker_end]);
+    output.push_str("\n");
+    if title_comparable_text(existing_block) == title_comparable_text(title) {
+        output.push_str(&heading);
+        output.push_str(&markdown[content_end..]);
+    } else {
+        output.push_str(&heading);
+        output.push_str("\n\n");
+        output.push_str(&markdown[content_start..]);
+    }
+    output
+}
+
+fn promote_start_to_heading(markdown: &str, title: &str, level: usize) -> String {
+    let mut content_start = 0;
+    while markdown[content_start..].starts_with('\n') || markdown[content_start..].starts_with(' ')
+    {
+        content_start += 1;
+        if content_start >= markdown.len() {
+            break;
+        }
+    }
+    let heading = format!("{} {}", "#".repeat(level), trim_inline(title));
+    if content_start >= markdown.len() {
+        return heading;
+    }
+    let content_end = markdown[content_start..]
+        .find("\n\n")
+        .map(|offset| content_start + offset)
+        .unwrap_or(markdown.len());
+    let existing_block = markdown[content_start..content_end].trim();
+    if existing_block.starts_with('#') {
+        return markdown.to_string();
+    }
+    let mut output = String::new();
+    output.push_str(&markdown[..content_start]);
+    if title_comparable_text(existing_block) == title_comparable_text(title) {
+        output.push_str(&heading);
+        output.push_str(&markdown[content_end..]);
+    } else {
+        output.push_str(&heading);
+        output.push_str("\n\n");
+        output.push_str(&markdown[content_start..]);
+    }
+    output
+}
+
+fn output_chapters_from_spines(
+    chapters: &[ChapterData],
+    converted_spines: &[String],
+    segments: &[LogicalChapterSegment],
+) -> Vec<(String, String, String)> {
+    if segments.is_empty() {
+        return chapters
+            .iter()
+            .zip(converted_spines.iter())
+            .map(|(chapter, converted)| {
+                (
+                    chapter.file_name.clone(),
+                    chapter
+                        .title
+                        .clone()
+                        .unwrap_or_else(|| fallback_chapter_title(&chapter.file_name)),
+                    converted.clone(),
+                )
+            })
+            .collect();
+    }
+
+    let mut output = Vec::new();
+    for (index, segment) in segments.iter().enumerate() {
+        let next = segments.get(index + 1).map(|segment| &segment.start);
+        let mut pieces = Vec::new();
+        for spine_index in segment.start.spine_index
+            ..=next
+                .map(|target| target.spine_index)
+                .unwrap_or_else(|| converted_spines.len().saturating_sub(1))
+        {
+            let Some(spine) = converted_spines.get(spine_index) else {
+                continue;
+            };
+            let start = if spine_index == segment.start.spine_index {
+                if index == 0 {
+                    0
+                } else {
+                    segment
+                        .start
+                        .fragment
+                        .as_deref()
+                        .and_then(|fragment| anchor_position(spine, fragment))
+                        .unwrap_or(0)
+                }
+            } else {
+                0
+            };
+            let end = if let Some(next) = next {
+                if spine_index == next.spine_index {
+                    match next.fragment.as_deref() {
+                        Some(fragment) => anchor_position(spine, fragment).unwrap_or(spine.len()),
+                        None => 0,
+                    }
+                } else {
+                    spine.len()
+                }
+            } else {
+                spine.len()
+            };
+            if end <= start {
+                continue;
+            }
+            let piece = spine[start..end].trim();
+            if !piece.is_empty() {
+                pieces.push(piece.to_string());
+            }
+        }
+        let mut markdown = pieces.join("\n\n");
+        if markdown.trim().is_empty() {
+            markdown = format!("# {}", segment.title);
+        }
+        output.push((
+            segment.file_name.clone(),
+            segment.title.clone(),
+            cleanup(&markdown),
+        ));
+    }
+    output
+}
+
+fn anchor_position(markdown: &str, fragment: &str) -> Option<usize> {
+    markdown.find(&format!(r#"<a id="{fragment}"></a>"#))
 }
 
 fn readme(package: &EpubPackage, chapters: &[(String, String, String)]) -> String {
@@ -999,9 +1753,185 @@ fn cleanup(markdown: &str) -> String {
     let space_re = Regex::new(r"[ \t]+").expect("valid regex");
     let newline_re = Regex::new(r"\n{3,}").expect("valid regex");
     let value = space_re.replace_all(markdown, " ");
+    let value = structure_flat_toc_blocks(&value);
     let value = newline_re.replace_all(&value, "\n\n");
     let value = remove_duplicate_leading_title_blocks(&value);
     format!("{}\n", value.trim())
+}
+
+fn structure_flat_toc_blocks(markdown: &str) -> String {
+    let mut previous_was_toc_heading = false;
+    let mut blocks = Vec::new();
+    for block in markdown.split("\n\n") {
+        let structured = structure_flat_toc_block(block, previous_was_toc_heading);
+        previous_was_toc_heading = is_toc_heading_block(block);
+        if previous_was_toc_heading && structured != block {
+            previous_was_toc_heading = false;
+        }
+        blocks.push(structured);
+    }
+    blocks.join("\n\n")
+}
+
+fn structure_flat_toc_block(block: &str, previous_was_toc_heading: bool) -> String {
+    let trimmed = block.trim();
+    if let Some((heading, body)) = toc_heading_block_and_body(trimmed) {
+        let entries = split_flat_toc_entries(&body);
+        if entries.len() < 3 {
+            return block.to_string();
+        }
+        return format!("{heading}\n\n{}", format_toc_entries(entries));
+    }
+    if let Some((heading, body)) = flat_toc_heading_and_body(trimmed) {
+        let entries = split_flat_toc_entries(&unwrap_toc_paragraph(body));
+        if entries.len() < 3 {
+            return block.to_string();
+        }
+        return format!("## {heading}\n\n{}", format_toc_entries(entries));
+    }
+    if previous_was_toc_heading {
+        let entries = split_flat_toc_entries(&unwrap_toc_paragraph(trimmed));
+        if entries.len() >= 3 {
+            return format_toc_entries(entries);
+        }
+    }
+    block.to_string()
+}
+
+fn format_toc_entries(entries: Vec<String>) -> String {
+    entries
+        .into_iter()
+        .map(|entry| format!("- {}", normalize_toc_entry(&entry)))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn normalize_toc_entry(entry: &str) -> String {
+    Regex::new(r#"\[((?:\s*<a\s+id="[^"]+"></a>)+\s*)([^\]]+?)\]\(([^)]+)\)"#)
+        .expect("valid regex")
+        .replace_all(entry, |captures: &regex::Captures<'_>| {
+            format!(
+                "{} [{}]({})",
+                captures[1].trim(),
+                captures[2].trim(),
+                captures[3].trim()
+            )
+        })
+        .to_string()
+}
+
+fn toc_heading_block_and_body(block: &str) -> Option<(String, String)> {
+    let mut lines = block.lines();
+    let first_line = lines.next()?.trim();
+    let body = lines.collect::<Vec<_>>().join("\n");
+    if body.trim().is_empty() || !is_toc_heading_block(first_line) {
+        return None;
+    }
+    Some((first_line.to_string(), unwrap_toc_paragraph(&body)))
+}
+
+fn flat_toc_heading_and_body(block: &str) -> Option<(&'static str, &str)> {
+    let lower = block.to_lowercase();
+    if lower == "contents" || lower == "table of contents" {
+        return None;
+    }
+    if lower.starts_with("table of contents ") {
+        return Some((
+            "Table of Contents",
+            block["table of contents".len()..].trim(),
+        ));
+    }
+    if lower.starts_with("contents ") {
+        return Some(("Contents", block["contents".len()..].trim()));
+    }
+    None
+}
+
+fn is_toc_heading_block(block: &str) -> bool {
+    let heading = Regex::new(r"^#{1,6}\s+").expect("valid regex");
+    let tag = Regex::new(r"<[^>]+>").expect("valid regex");
+    let text = heading.replace(block.trim(), "");
+    let text = tag.replace_all(&text, "");
+    matches!(
+        text.trim().to_lowercase().as_str(),
+        "contents" | "table of contents"
+    )
+}
+
+fn split_flat_toc_entries(body: &str) -> Vec<String> {
+    let normalized_body = unwrap_toc_paragraph(body).replace("&nbsp;", " ");
+    let markers = flat_toc_marker_starts(&normalized_body);
+    if markers.len() < 3 {
+        return Vec::new();
+    }
+
+    markers
+        .iter()
+        .enumerate()
+        .filter_map(|(index, start)| {
+            let end = markers
+                .get(index + 1)
+                .copied()
+                .unwrap_or(normalized_body.len());
+            let entry = normalized_body[*start..end].trim();
+            if entry.is_empty() {
+                None
+            } else {
+                Some(entry.to_string())
+            }
+        })
+        .collect()
+}
+
+fn unwrap_toc_paragraph(value: &str) -> String {
+    let trimmed = value.trim();
+    Regex::new(r"(?is)^<p(?:\s[^>]*)?>(.*)</p>$")
+        .expect("valid regex")
+        .captures(trimmed)
+        .and_then(|captures| captures.get(1).map(|body| body.as_str().trim().to_string()))
+        .unwrap_or_else(|| trimmed.to_string())
+}
+
+fn flat_toc_marker_starts(body: &str) -> Vec<usize> {
+    body.char_indices()
+        .filter_map(|(index, character)| {
+            if character.is_ascii_digit() && is_flat_toc_marker_at(body, index) {
+                Some(index)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn is_flat_toc_marker_at(body: &str, index: usize) -> bool {
+    let bytes = body.as_bytes();
+    if index > 0 && !bytes[index - 1].is_ascii_whitespace() {
+        return false;
+    }
+
+    let mut cursor = index;
+    let mut saw_digit = false;
+    while cursor < bytes.len() && bytes[cursor].is_ascii_digit() {
+        saw_digit = true;
+        cursor += 1;
+    }
+    if !saw_digit {
+        return false;
+    }
+
+    while cursor < bytes.len() && bytes[cursor] == b'.' {
+        cursor += 1;
+        let group_start = cursor;
+        while cursor < bytes.len() && bytes[cursor].is_ascii_digit() {
+            cursor += 1;
+        }
+        if group_start == cursor {
+            return false;
+        }
+    }
+
+    cursor < bytes.len() && bytes[cursor].is_ascii_whitespace()
 }
 
 fn remove_duplicate_leading_title_blocks(markdown: &str) -> String {
@@ -1223,6 +2153,82 @@ mod tests {
         let markdown = "# 第零七章 • 计算\n\n第零七章 • 计算\n\n正文开始。";
         let cleaned = cleanup(markdown);
         assert_eq!(cleaned.matches("第零七章 • 计算").count(), 1);
+    }
+
+    #[test]
+    fn renders_flat_nav_links_as_toc_list() {
+        let mut chapter_links = HashMap::new();
+        chapter_links.insert("OPS/chapter1.xhtml".to_string(), "001-Intro.md".to_string());
+        chapter_links.insert(
+            "OPS/chapter1.xhtml#overview".to_string(),
+            "001-Intro.md#overview".to_string(),
+        );
+        let markdown = convert_xhtml_to_markdown(
+            br#"<html><body><nav><h1>Contents</h1><a href="chapter1.xhtml">1 Introduction to Fennel and Lua</a><a href="chapter1.xhtml#overview">1.1 Overview of Lua Language</a><a href="chapter2.xhtml">2 Setting Up Your Fennel Environment</a></nav></body></html>"#,
+            "OPS/nav.xhtml",
+            &AssetMapper::default(),
+            &ChapterLinkMap { epub_path_to_markdown: chapter_links },
+        )
+        .expect("convert nav");
+
+        assert!(markdown.contains("## Contents"));
+        assert!(markdown.contains("- [1 Introduction to Fennel and Lua](001-Intro.md)"));
+        assert!(markdown.contains("- [1.1 Overview of Lua Language](001-Intro.md#overview)"));
+        assert!(markdown.contains("- [2 Setting Up Your Fennel Environment](chapter2.xhtml)"));
+        assert!(!markdown.contains("Lua 1.1 Overview"));
+    }
+
+    #[test]
+    fn structures_flat_plain_text_toc() {
+        let markdown = cleanup("Contents 1 Introduction to Fennel and Lua 1.1 Overview of Lua Language 1.2 Fennel as a Lisp for Lua 2 Setting Up Your Fennel Environment 2.1 Installing Lua");
+
+        assert!(markdown.contains("## Contents"));
+        assert!(markdown.contains("- 1 Introduction to Fennel and Lua"));
+        assert!(markdown.contains("- 1.1 Overview of Lua Language"));
+        assert!(markdown.contains("- 2 Setting Up Your Fennel Environment"));
+        assert!(!markdown.contains("Lua 1.1 Overview"));
+    }
+
+    #[test]
+    fn structures_flat_toc_paragraph_after_contents_heading() {
+        let markdown = cleanup("# Contents\n\n1 [Introduction to Fennel and Lua](chapter-1.md) 1.1 [Overview of Lua Language](chapter-1.md#overview) 1.2 [Fennel as a Lisp for Lua](chapter-1.md#fennel) 2 [Setting Up Your Fennel Environment](chapter-2.md)");
+
+        assert!(markdown.contains("# Contents"));
+        assert!(markdown.contains("- 1 [Introduction to Fennel and Lua](chapter-1.md)"));
+        assert!(markdown.contains("- 1.1 [Overview of Lua Language](chapter-1.md#overview)"));
+        assert!(markdown.contains("- 2 [Setting Up Your Fennel Environment](chapter-2.md)"));
+        assert!(!markdown.contains("Lua](chapter-1.md) 1.1"));
+    }
+
+    #[test]
+    fn structures_flat_toc_after_single_newline_heading() {
+        let markdown = cleanup("# Contents\n1 [Introduction to Fennel and Lua](chapter-1.md) 1.1 [Overview of Lua Language](chapter-1.md#overview) 1.2 [Fennel as a Lisp for Lua](chapter-1.md#fennel) 2 [Setting Up Your Fennel Environment](chapter-2.md)");
+
+        assert!(markdown.contains("# Contents"));
+        assert!(markdown.contains("- 1 [Introduction to Fennel and Lua](chapter-1.md)"));
+        assert!(markdown.contains("- 1.1 [Overview of Lua Language](chapter-1.md#overview)"));
+        assert!(!markdown.contains("Lua](chapter-1.md) 1.1"));
+    }
+
+    #[test]
+    fn structures_flat_html_paragraph_toc() {
+        let markdown = cleanup("# Contents\n<p>1 <a href=\"chapter-1.md\">Introduction to Fennel and Lua</a> 1.1 <a href=\"chapter-1.md#overview\">Overview of Lua Language</a> 1.2 <a href=\"chapter-1.md#fennel\">Fennel as a Lisp for Lua</a> 2 <a href=\"chapter-2.md\">Setting Up Your Fennel Environment</a></p>");
+
+        assert!(
+            markdown.contains("- 1 <a href=\"chapter-1.md\">Introduction to Fennel and Lua</a>")
+        );
+        assert!(markdown
+            .contains("- 1.1 <a href=\"chapter-1.md#overview\">Overview of Lua Language</a>"));
+        assert!(!markdown.contains("- <p>1"));
+    }
+
+    #[test]
+    fn moves_inline_anchors_out_of_toc_link_labels() {
+        let markdown = cleanup("# Contents\n\n1 <a id=\"QQ2-4-3\"></a> [<a id=\"kobo.3.1\"></a> Introduction to Fennel and Lua](chapter-1.md) 1.1 <a id=\"QQ2-4-4\"></a> [<a id=\"kobo.5.1\"></a> Overview of Lua Language](chapter-1.md#overview) 2 <a id=\"QQ2-5-9\"></a> [<a id=\"kobo.7.1\"></a> Setting Up Your Fennel Environment](chapter-2.md)");
+
+        assert!(!markdown.contains("[<a id=\"kobo.3.1\"></a> Introduction"));
+        assert!(markdown
+            .contains("<a id=\"kobo.3.1\"></a> [Introduction to Fennel and Lua](chapter-1.md)"));
     }
 
     #[test]

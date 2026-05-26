@@ -1,3 +1,3 @@
 fn main() {
-    epubmd_reader_lib::run();
+    goosereader_lib::run();
 }

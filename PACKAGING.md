@@ -1,9 +1,9 @@
 # Packaging
 
-`epubmd` now has two deliverables:
+`goosereader` has two deliverables:
 
 1. Rust CLI converter: converts a DRM-free EPUB into a Markdown/assets zip.
-2. Tauri reader app: opens an epubmd-generated zip and renders the Markdown with the zip's `style.css`.
+2. Tauri goosereader app: opens an epubmd-generated zip and renders the Markdown with the zip's `style.css`.
 
 ## Build the CLI converter
 
@@ -34,7 +34,7 @@ Outputs use the current OS/CPU in the filename, for example:
 
 For release distribution, run the same Cargo build/package command on each target platform or from CI cross-target jobs.
 
-## Build the Tauri reader app
+## Build the goosereader app
 
 Install frontend/Rust dependencies once:
 
@@ -42,7 +42,7 @@ Install frontend/Rust dependencies once:
 npm install
 ```
 
-Build the reader app:
+Build the goosereader app:
 
 ```sh
 npm run tauri:build
@@ -56,13 +56,13 @@ Create a local app archive:
 
 Outputs:
 
-- `dist/epubmd.app`
-- `dist/epubmd-reader-0.1.0.zip`
+- `dist/goosereader.app`
+- `dist/goosereader-0.1.0.zip`
 
 Launch locally:
 
 ```sh
-open -n dist/epubmd.app
+open -n dist/goosereader.app
 ```
 
 The app bundle is suitable for local testing. For public distribution, sign with a Developer ID Application certificate, enable hardened runtime, then notarize and staple with Apple notary credentials.
