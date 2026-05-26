@@ -9,6 +9,7 @@
     "tauri": "tauri",
     "tauri:build": "tauri build",
     "tauri:dev": "tauri dev",
+    "tauri:ios": "script/tauri_ios_xcode_env.sh",
     "test:frontend": "rm -rf dist-test && tsc src/cssScope.ts src/cssScope.test.ts src/readerNavigation.ts src/readerNavigation.test.ts src/chapterSections.ts src/chapterSections.test.ts src/tocStructure.ts src/tocStructure.test.ts --outDir dist-test --module ES2022 --target ES2022 --moduleResolution Bundler --skipLibCheck --strict --noEmit false && node dist-test/cssScope.test.js && node dist-test/readerNavigation.test.js && node dist-test/chapterSections.test.js && node dist-test/tocStructure.test.js"
   },
   "dependencies": {

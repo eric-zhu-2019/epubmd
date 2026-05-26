@@ -97,6 +97,32 @@ fn splits_flat_navigation_anchors_into_logical_chapters_across_spine_files() {
 }
 
 #[test]
+fn preserves_single_spine_books_when_nav_entries_have_no_fragment_boundaries() {
+    let temp = tempdir().unwrap();
+    let epub = temp.path().join("single-spine-no-fragments.epub");
+    make_single_spine_no_fragment_nav_epub(&epub);
+    let output = temp.path().join("single-spine-no-fragments.zmd");
+
+    convert_epub_to_zip(&epub, &output, false).unwrap();
+
+    let mut zip = ZipArchive::new(File::open(&output).unwrap()).unwrap();
+    let chapter_names = zip
+        .file_names()
+        .filter(|name| name.starts_with("chapters/") && name.ends_with(".md"))
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+
+    assert_eq!(chapter_names, vec!["chapters/001-Chapter-1-Intro.md"]);
+
+    let chapter = read_zip_text(&mut zip, "chapters/001-Chapter-1-Intro.md");
+    assert!(chapter.contains("# Chapter 1 Intro"));
+    assert!(chapter.contains("First chapter body."));
+    assert!(chapter.contains("# Chapter 2 Parser"));
+    assert!(chapter.contains("Second chapter body must not be deleted."));
+    assert!(chapter.contains("```\nint main(void) {\n    return 0;\n}\n```"));
+}
+
+#[test]
 fn missing_referenced_asset_fails_clearly() {
     let temp = tempdir().unwrap();
     let epub = temp.path().join("sample.epub");
@@ -108,6 +134,57 @@ fn missing_referenced_asset_fails_clearly() {
         ConversionError::MalformedEpub(message) => assert!(message.contains("image asset")),
         other => panic!("unexpected error: {other:?}"),
     }
+}
+
+fn make_single_spine_no_fragment_nav_epub(path: &Path) {
+    let file = File::create(path).unwrap();
+    let mut zip = ZipWriter::new(file);
+    let options = SimpleFileOptions::default();
+    zip.start_file("META-INF/container.xml", options).unwrap();
+    zip.write_all(br#"<?xml version="1.0" encoding="UTF-8"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles>
+</container>"#).unwrap();
+
+    zip.start_file("OEBPS/content.opf", options).unwrap();
+    zip.write_all(
+        br#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns:dc="http://purl.org/dc/elements/1.1/">
+  <metadata><dc:title>Single Spine Book</dc:title></metadata>
+  <manifest>
+    <item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>
+    <item id="body" href="body.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine toc="ncx"><itemref idref="body"/></spine>
+</package>"#,
+    )
+    .unwrap();
+
+    zip.start_file("OEBPS/toc.ncx", options).unwrap();
+    zip.write_all(br#"<?xml version="1.0" encoding="UTF-8"?>
+<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/">
+  <navMap>
+    <navPoint id="c1" playOrder="1"><navLabel><text>Chapter 1 Intro</text></navLabel><content src="body.xhtml"/></navPoint>
+    <navPoint id="c2" playOrder="2"><navLabel><text>Chapter 2 Parser</text></navLabel><content src="body.xhtml"/></navPoint>
+  </navMap>
+</ncx>"#).unwrap();
+
+    zip.start_file("OEBPS/body.xhtml", options).unwrap();
+    zip.write_all(
+        br#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><body>
+<h1>Chapter 1 Intro</h1>
+<p>First chapter body.</p>
+<h1>Chapter 2 Parser</h1>
+<p>Second chapter body must not be deleted.</p>
+<pre><code>int main(void) {
+    return 0;
+}</code></pre>
+</body></html>"#,
+    )
+    .unwrap();
+
+    zip.finish().unwrap();
 }
 
 fn make_mixed_navigation_epub(path: &Path) {

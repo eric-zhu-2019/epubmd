@@ -84,6 +84,7 @@ type ReaderState = {
   themePath?: string;
   pendingFragment?: string;
   expandedChapterPaths: Set<string>;
+  chapterListScrollTop: number;
   renderToken: number;
   colorMode: ColorMode;
 };
@@ -98,6 +99,7 @@ const state: ReaderState = {
   libraryLoading: true,
   themeLoading: true,
   expandedChapterPaths: new Set(),
+  chapterListScrollTop: 0,
   renderToken: 0,
   colorMode: readStoredColorMode(),
 };
@@ -120,7 +122,8 @@ marked.use({
   breaks: false,
 });
 
-function renderShell(): void {
+function renderShell(options: { preserveChapterScroll?: boolean } = {}): void {
+  if (options.preserveChapterScroll !== false) captureChapterListScroll();
   const book = state.book;
   const current = currentChapter();
   app.innerHTML = `
@@ -228,6 +231,7 @@ function renderShell(): void {
   document.querySelector<HTMLButtonElement>('#next-chapter')?.addEventListener('click', () => moveChapter(1));
   bindReaderGestures();
   bindReaderLinks();
+  restoreChapterListScroll();
   void renderSelectedChapter(book, current);
 }
 
@@ -412,7 +416,7 @@ async function importEpub(): Promise<void> {
     state.error = error instanceof Error ? error.message : String(error);
   } finally {
     state.importing = false;
-    renderShell();
+    renderShell({ preserveChapterScroll: false });
   }
 }
 
@@ -430,7 +434,7 @@ async function openLibraryBook(path: string): Promise<void> {
     state.error = error instanceof Error ? error.message : String(error);
   } finally {
     state.loading = false;
-    renderShell();
+    renderShell({ preserveChapterScroll: false });
   }
 }
 
@@ -448,6 +452,7 @@ async function deleteLibraryBook(path: string, title: string): Promise<void> {
       state.selectedPath = undefined;
       state.pendingFragment = undefined;
       state.expandedChapterPaths = new Set();
+      state.chapterListScrollTop = 0;
     }
     await refreshLibrary(false);
   } catch (error) {
@@ -487,6 +492,7 @@ function openBookPayload(book: BookPayload, path: string, progressChapterPath?: 
   state.selectedPath = selectedPath;
   state.pendingFragment = undefined;
   state.expandedChapterPaths = new Set([selectedPath].filter((path): path is string => Boolean(path)));
+  state.chapterListScrollTop = 0;
 }
 
 async function selectTheme(path: string): Promise<void> {
@@ -598,6 +604,17 @@ function selectChapter(chapterPath: string, options: { fragment?: string } = {})
   state.expandedChapterPaths.add(chapterPath);
   renderShell();
   void saveCurrentReadingProgress();
+}
+
+function captureChapterListScroll(): void {
+  const chapterList = document.querySelector<HTMLElement>('.chapter-list');
+  if (chapterList) state.chapterListScrollTop = chapterList.scrollTop;
+}
+
+function restoreChapterListScroll(): void {
+  const chapterList = document.querySelector<HTMLElement>('.chapter-list');
+  if (!chapterList) return;
+  chapterList.scrollTop = state.chapterListScrollTop;
 }
 
 function bindReaderGestures(): void {

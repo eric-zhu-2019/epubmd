@@ -827,7 +827,7 @@ fn render_block(node: Node<'_, '_>, context: &RenderContext<'_>) -> String {
         "pre" => format!(
             "{}{}",
             anchor_prefix(node),
-            fenced_code_block(&raw_text(node))
+            fenced_code_block(&preformatted_text(node))
         ),
         "hr" => "---".to_string(),
         "table" => format!("{}{}", anchor_prefix(node), render_table(node, context)),
@@ -1208,11 +1208,28 @@ fn logical_chapter_segments(
             },
         });
     }
+    if has_ambiguous_segment_boundaries(&segments) {
+        return Vec::new();
+    }
     if segments.len() < 2 {
         Vec::new()
     } else {
         segments
     }
+}
+
+fn has_ambiguous_segment_boundaries(segments: &[LogicalChapterSegment]) -> bool {
+    let mut previous_by_spine: HashMap<usize, &NavTarget> = HashMap::new();
+    for segment in segments {
+        let Some(previous) = previous_by_spine.insert(segment.start.spine_index, &segment.start)
+        else {
+            continue;
+        };
+        if segment.start.fragment.is_none() || previous.fragment == segment.start.fragment {
+            return true;
+        }
+    }
+    false
 }
 
 fn is_likely_logical_chapter_title(title: &str) -> bool {
@@ -1729,16 +1746,46 @@ fn collapsed_text(node: Node<'_, '_>) -> Option<String> {
     }
 }
 
-fn raw_text(node: Node<'_, '_>) -> String {
-    node.descendants()
-        .filter(|descendant| descendant.node_type() == NodeType::Text)
-        .filter_map(|descendant| descendant.text())
-        .collect::<String>()
+fn preformatted_text(node: Node<'_, '_>) -> String {
+    let mut text = String::new();
+    append_preformatted_text(node, &mut text);
+    text
+}
+
+fn append_preformatted_text(node: Node<'_, '_>, output: &mut String) {
+    for child in node.children() {
+        match child.node_type() {
+            NodeType::Text => output.push_str(child.text().unwrap_or("")),
+            NodeType::Element if child.tag_name().name() == "br" => output.push('\n'),
+            NodeType::Element => append_preformatted_text(child, output),
+            _ => {}
+        }
+    }
 }
 
 fn fenced_code_block(code: &str) -> String {
-    let fence = if code.contains("```") { "~~~~" } else { "```" };
-    format!("{fence}\n{}\n{fence}", code.trim())
+    let fence = code_fence_for(code);
+    let closing_separator = if code.ends_with('\n') { "" } else { "\n" };
+    format!("{fence}\n{code}{closing_separator}{fence}")
+}
+
+fn code_fence_for(code: &str) -> String {
+    let longest_backtick_run = longest_repeated_char_run(code, '`');
+    "`".repeat((longest_backtick_run + 1).max(3))
+}
+
+fn longest_repeated_char_run(value: &str, needle: char) -> usize {
+    let mut longest = 0;
+    let mut current = 0;
+    for character in value.chars() {
+        if character == needle {
+            current += 1;
+            longest = longest.max(current);
+        } else {
+            current = 0;
+        }
+    }
+    longest
 }
 
 fn anchor_prefix(node: Node<'_, '_>) -> String {
@@ -1752,11 +1799,96 @@ fn anchor_prefix(node: Node<'_, '_>) -> String {
 fn cleanup(markdown: &str) -> String {
     let space_re = Regex::new(r"[ \t]+").expect("valid regex");
     let newline_re = Regex::new(r"\n{3,}").expect("valid regex");
-    let value = space_re.replace_all(markdown, " ");
+    let (protected, code_blocks) = protect_fenced_code_blocks(markdown);
+    let value = space_re.replace_all(&protected, " ");
     let value = structure_flat_toc_blocks(&value);
     let value = newline_re.replace_all(&value, "\n\n");
     let value = remove_duplicate_leading_title_blocks(&value);
+    let value = restore_fenced_code_blocks(&value, &code_blocks);
     format!("{}\n", value.trim())
+}
+
+fn protect_fenced_code_blocks(markdown: &str) -> (String, Vec<String>) {
+    let mut protected = String::new();
+    let mut code_blocks = Vec::new();
+    let mut active_fence: Option<(char, usize)> = None;
+    let mut active_block = String::new();
+
+    for line in markdown.split_inclusive('\n') {
+        if let Some((fence_char, fence_len)) = active_fence {
+            active_block.push_str(line);
+            if is_closing_fence_line(line, fence_char, fence_len) {
+                let placeholder = fenced_code_placeholder(code_blocks.len());
+                code_blocks.push(std::mem::take(&mut active_block));
+                protected.push_str(&placeholder);
+                active_fence = None;
+            }
+            continue;
+        }
+
+        if let Some((fence_char, fence_len)) = opening_fence_line(line) {
+            active_block.push_str(line);
+            active_fence = Some((fence_char, fence_len));
+        } else {
+            protected.push_str(line);
+        }
+    }
+
+    if !active_block.is_empty() {
+        protected.push_str(&active_block);
+    }
+
+    (protected, code_blocks)
+}
+
+fn restore_fenced_code_blocks(markdown: &str, code_blocks: &[String]) -> String {
+    let mut restored = markdown.to_string();
+    for (index, code_block) in code_blocks.iter().enumerate() {
+        restored = restored.replace(&fenced_code_placeholder(index), code_block);
+    }
+    restored
+}
+
+fn fenced_code_placeholder(index: usize) -> String {
+    format!("\u{E000}EPUBMD_FENCED_CODE_BLOCK_{index}\u{E000}")
+}
+
+fn opening_fence_line(line: &str) -> Option<(char, usize)> {
+    let trimmed = trim_line_ending(line).trim_start();
+    let indent = trim_line_ending(line).len() - trim_line_ending(line).trim_start().len();
+    if indent > 3 {
+        return None;
+    }
+    let fence_char = trimmed
+        .chars()
+        .next()
+        .filter(|char| matches!(char, '`' | '~'))?;
+    let fence_len = trimmed
+        .chars()
+        .take_while(|char| *char == fence_char)
+        .count();
+    if fence_len >= 3 {
+        Some((fence_char, fence_len))
+    } else {
+        None
+    }
+}
+
+fn is_closing_fence_line(line: &str, fence_char: char, opening_len: usize) -> bool {
+    let trimmed = trim_line_ending(line).trim_start();
+    let indent = trim_line_ending(line).len() - trim_line_ending(line).trim_start().len();
+    if indent > 3 {
+        return false;
+    }
+    let fence_len = trimmed
+        .chars()
+        .take_while(|char| *char == fence_char)
+        .count();
+    fence_len >= opening_len && trimmed[fence_len..].trim().is_empty()
+}
+
+fn trim_line_ending(line: &str) -> &str {
+    line.trim_end_matches('\n').trim_end_matches('\r')
 }
 
 fn structure_flat_toc_blocks(markdown: &str) -> String {
@@ -2153,6 +2285,53 @@ mod tests {
         let markdown = "# 第零七章 • 计算\n\n第零七章 • 计算\n\n正文开始。";
         let cleaned = cleanup(markdown);
         assert_eq!(cleaned.matches("第零七章 • 计算").count(), 1);
+    }
+
+    #[test]
+    fn preserves_preformatted_code_exactly() {
+        let markdown = convert_xhtml_to_markdown(
+            b"<html><body><p>Before.</p><pre><code>fn main() {\n    let label = \"a   b\";\n\tprintln!(\"{}\", label);\n}\n</code></pre><p>After.</p></body></html>",
+            "OPS/code.xhtml",
+            &AssetMapper::default(),
+            &ChapterLinkMap {
+                epub_path_to_markdown: HashMap::new(),
+            },
+        )
+        .expect("convert code");
+
+        assert!(markdown.contains(
+            "```\nfn main() {\n    let label = \"a   b\";\n\tprintln!(\"{}\", label);\n}\n```\n"
+        ));
+    }
+
+    #[test]
+    fn preserves_preformatted_blank_lines_and_br_elements() {
+        let markdown = convert_xhtml_to_markdown(
+            b"<html><body><pre>line 1<br/>    line 2\n\n\tline 4</pre></body></html>",
+            "OPS/code.xhtml",
+            &AssetMapper::default(),
+            &ChapterLinkMap {
+                epub_path_to_markdown: HashMap::new(),
+            },
+        )
+        .expect("convert pre");
+
+        assert_eq!(markdown, "```\nline 1\n    line 2\n\n\tline 4\n```\n");
+    }
+
+    #[test]
+    fn uses_longer_fence_when_code_contains_backticks() {
+        assert_eq!(
+            fenced_code_block("let markdown = \"```\";\nlet more = \"````\";"),
+            "`````\nlet markdown = \"```\";\nlet more = \"````\";\n`````"
+        );
+    }
+
+    #[test]
+    fn cleanup_does_not_rewrite_fenced_code_blocks() {
+        let cleaned = cleanup("Intro\n\n```\nlet x =  1;\n\n    let y =\t2;\n```\n\nDone");
+
+        assert!(cleaned.contains("```\nlet x =  1;\n\n    let y =\t2;\n```"));
     }
 
     #[test]
