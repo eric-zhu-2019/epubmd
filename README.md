@@ -1,11 +1,17 @@
 # epubmd
 
-`epubmd` is a Rust CLI that converts DRM-free EPUB files into a zip archive of Markdown chapters, assets, `README.md`, and `style.css`. The repo also includes a Tauri 2 reader app that opens those zip archives and renders the Markdown like an e-reader using the archive's `style.css`.
+`epubmd` is a Rust CLI that converts DRM-free EPUB files into a zip archive of Markdown chapters, assets, `README.md`, and `style.css`. The repo also includes a Tauri 2 reader app that imports EPUBs into `.zmd` Markdown ZIP books and renders them like a small e-reader.
 
 ## CLI converter
 
 ```sh
 cargo run -p epubmd -- book.epub --output book-md.zip
+```
+
+The converter also accepts `.zmd` as an output extension for reader-library books:
+
+```sh
+cargo run -p epubmd -- book.epub --output book.zmd
 ```
 
 Options:
@@ -38,7 +44,13 @@ npm run tauri:dev
 npm run tauri:build
 ```
 
-Inside the app, choose **Open zip** and select a zip produced by the CLI.
+Inside the app:
+
+- **Import EPUB** converts a DRM-free `.epub` to a `.zmd` Markdown ZIP archive.
+- Imported books are stored in `~/.config/epubmd/books/`.
+- The sidebar lists `.zmd` books from that folder and opens the selected book for reading.
+- Put Typora-compatible `.css` files in `~/.config/epubmd/themes/`, then choose them from the reader's **Theme** selector. Typora selectors such as `#write`, `body`, and `html` are scoped to the Markdown reading pane.
+- While reading, the sidebar shows the book's chapters and jumps directly to the selected chapter.
 
 ## Packaging
 

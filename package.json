@@ -8,7 +8,8 @@
     "build": "tsc && vite build",
     "tauri": "tauri",
     "tauri:build": "tauri build",
-    "tauri:dev": "tauri dev"
+    "tauri:dev": "tauri dev",
+    "test:frontend": "rm -rf dist-test && tsc src/cssScope.ts src/cssScope.test.ts src/readerNavigation.ts src/readerNavigation.test.ts --outDir dist-test --module ES2022 --target ES2022 --moduleResolution Bundler --skipLibCheck --strict --noEmit false && node dist-test/cssScope.test.js && node dist-test/readerNavigation.test.js"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",

@@ -4,6 +4,7 @@
 dist
 node_modules
 dist-web
+dist-test
 src-tauri/target
 output
 

@@ -214,18 +214,18 @@ pub fn convert_epub_to_zip(
 ) -> Result<PathBuf, ConversionError> {
     let epub_path = epub_path.as_ref();
     let mut destination = output_zip_path.as_ref().to_path_buf();
-    if destination
+    let supported_archive_extension = destination
         .extension()
         .and_then(|value| value.to_str())
-        .map(|value| value.eq_ignore_ascii_case("zip"))
-        != Some(true)
-    {
+        .map(|value| value.eq_ignore_ascii_case("zip") || value.eq_ignore_ascii_case("zmd"))
+        .unwrap_or(false);
+    if !supported_archive_extension {
         destination.set_extension("zip");
     }
     if destination.exists() {
         if !overwrite {
             return Err(ConversionError::FileSystem(format!(
-                "destination zip already exists: {}. Use --force to replace it",
+                "destination archive already exists: {}. Use --force to replace it",
                 destination.display()
             )));
         }
@@ -1223,5 +1223,66 @@ mod tests {
         let markdown = "# 第零七章 • 计算\n\n第零七章 • 计算\n\n正文开始。";
         let cleaned = cleanup(markdown);
         assert_eq!(cleaned.matches("第零七章 • 计算").count(), 1);
+    }
+
+    #[test]
+    fn preserves_zmd_destination_extension() {
+        let epub = std::env::temp_dir().join(format!(
+            "epubmd-zmd-extension-source-{}.epub",
+            std::process::id()
+        ));
+        let destination = std::env::temp_dir().join(format!(
+            "epubmd-zmd-extension-test-{}.zmd",
+            std::process::id()
+        ));
+        write_minimal_epub(&epub);
+
+        let written = convert_epub_to_zip(&epub, &destination, true).expect("convert epub");
+
+        assert_eq!(written, destination);
+        assert!(destination.exists());
+        assert!(!destination.with_extension("zip").exists());
+
+        let _ = std::fs::remove_file(epub);
+        let _ = std::fs::remove_file(destination);
+    }
+
+    fn write_minimal_epub(path: &Path) {
+        let file = File::create(path).expect("create epub");
+        let mut zip = ZipWriter::new(file);
+        let options = SimpleFileOptions::default();
+        zip.start_file("META-INF/container.xml", options).unwrap();
+        zip.write_all(
+            br#"<?xml version="1.0"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles>
+    <rootfile full-path="OPS/package.opf" media-type="application/oebps-package+xml"/>
+  </rootfiles>
+</container>"#,
+        )
+        .unwrap();
+        zip.start_file("OPS/package.opf", options).unwrap();
+        zip.write_all(
+            br#"<?xml version="1.0"?>
+<package version="3.0" xmlns="http://www.idpf.org/2007/opf">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:title>ZMD Test</dc:title>
+  </metadata>
+  <manifest>
+    <item id="chapter" href="chapter.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine>
+    <itemref idref="chapter"/>
+  </spine>
+</package>"#,
+        )
+        .unwrap();
+        zip.start_file("OPS/chapter.xhtml", options).unwrap();
+        zip.write_all(
+            br#"<?xml version="1.0"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>Chapter One</title></head><body><h1>Chapter One</h1><p>Hello.</p></body></html>"#,
+        )
+        .unwrap();
+        zip.finish().unwrap();
     }
 }
