@@ -25,6 +25,7 @@ struct LibraryBook {
     chapter_count: usize,
     progress_chapter_path: Option<String>,
     modified_ms: u64,
+    cover_image: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -47,6 +48,7 @@ struct BookPayload {
     style_css: String,
     chapters: Vec<BookChapter>,
     assets: Vec<BookAsset>,
+    cover_image: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -60,6 +62,11 @@ struct BookChapter {
 struct BookAsset {
     path: String,
     data_url: String,
+}
+
+#[derive(Deserialize, Default)]
+struct BookMetadata {
+    cover_asset_path: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -240,6 +247,7 @@ fn load_book_archive(path: &Path) -> Result<BookPayload, String> {
     let mut style_css = String::new();
     let mut chapters = Vec::new();
     let mut assets = Vec::new();
+    let mut metadata = BookMetadata::default();
 
     for index in 0..archive.len() {
         let mut entry = archive
@@ -255,6 +263,9 @@ fn load_book_archive(path: &Path) -> Result<BookPayload, String> {
 
         if entry_path == "README.md" {
             readme = read_utf8_entry(&mut entry, &entry_path)?;
+        } else if entry_path == "metadata.json" {
+            let text = read_utf8_entry(&mut entry, &entry_path)?;
+            metadata = serde_json::from_str(&text).unwrap_or_default();
         } else if entry_path == "style.css" {
             style_css = read_utf8_entry(&mut entry, &entry_path)?;
         } else if entry_path.starts_with("chapters/") && entry_path.ends_with(".md") {
@@ -280,6 +291,7 @@ fn load_book_archive(path: &Path) -> Result<BookPayload, String> {
 
     order_chapters_from_readme(&mut chapters, &readme);
     assets.sort_by(|left, right| left.path.cmp(&right.path));
+    let cover_image = cover_image_from_assets(&assets, metadata.cover_asset_path.as_deref());
 
     if chapters.is_empty() {
         return Err("book archive does not contain chapters/*.md files".into());
@@ -299,6 +311,7 @@ fn load_book_archive(path: &Path) -> Result<BookPayload, String> {
         style_css,
         chapters,
         assets,
+        cover_image,
     })
 }
 
@@ -379,6 +392,8 @@ fn summarize_book(path: &Path) -> Result<LibraryBook, String> {
         ZipArchive::new(file).map_err(|error| format!("invalid book archive: {error}"))?;
     let mut readme = String::new();
     let mut chapter_count = 0;
+    let mut metadata = BookMetadata::default();
+    let mut asset_paths = Vec::new();
 
     for index in 0..archive.len() {
         let mut entry = archive
@@ -390,14 +405,21 @@ fn summarize_book(path: &Path) -> Result<LibraryBook, String> {
         let entry_path = normalize_zip_path(entry.name());
         if entry_path == "README.md" {
             readme = read_utf8_entry(&mut entry, &entry_path)?;
+        } else if entry_path == "metadata.json" {
+            let text = read_utf8_entry(&mut entry, &entry_path)?;
+            metadata = serde_json::from_str(&text).unwrap_or_default();
         } else if entry_path.starts_with("chapters/") && entry_path.ends_with(".md") {
             chapter_count += 1;
+        } else if entry_path.starts_with("assets/") && is_image_path(&entry_path) {
+            asset_paths.push(entry_path);
         }
     }
 
     let mut book = fallback_library_book(path);
     book.title = title_from_readme(&readme).unwrap_or(book.title);
     book.chapter_count = chapter_count;
+    book.cover_image = choose_cover_asset_path(&asset_paths, metadata.cover_asset_path.as_deref())
+        .and_then(|cover_path| read_asset_data_url_from_archive(&mut archive, &cover_path).ok());
     Ok(book)
 }
 
@@ -419,6 +441,7 @@ fn fallback_library_book(path: &Path) -> LibraryBook {
         chapter_count: 0,
         progress_chapter_path: None,
         modified_ms: modified_ms(path),
+        cover_image: None,
     }
 }
 
@@ -547,6 +570,74 @@ fn read_utf8_entry<R: Read>(reader: &mut R, path: &str) -> Result<String, String
         .read_to_string(&mut text)
         .map_err(|error| format!("{path} is not valid UTF-8: {error}"))?;
     Ok(text)
+}
+
+fn cover_image_from_assets(assets: &[BookAsset], metadata_path: Option<&str>) -> Option<String> {
+    let asset_paths = assets
+        .iter()
+        .map(|asset| asset.path.clone())
+        .collect::<Vec<_>>();
+    let cover_path = choose_cover_asset_path(&asset_paths, metadata_path)?;
+    assets
+        .iter()
+        .find(|asset| asset.path == cover_path)
+        .map(|asset| asset.data_url.clone())
+}
+
+fn choose_cover_asset_path(asset_paths: &[String], metadata_path: Option<&str>) -> Option<String> {
+    if let Some(path) = metadata_path
+        .map(normalize_zip_path)
+        .filter(|path| asset_paths.iter().any(|asset_path| asset_path == path))
+    {
+        return Some(path);
+    }
+    let mut image_paths = asset_paths
+        .iter()
+        .filter(|path| is_image_path(path))
+        .cloned()
+        .collect::<Vec<_>>();
+    image_paths.sort();
+    image_paths
+        .iter()
+        .find(|path| is_likely_cover_asset_path(path))
+        .cloned()
+        .or_else(|| image_paths.first().cloned())
+}
+
+fn is_likely_cover_asset_path(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    ["cover", "front", "title_page", "title-page", "titlepage"]
+        .iter()
+        .any(|needle| lower.contains(needle))
+}
+
+fn read_asset_data_url_from_archive(
+    archive: &mut ZipArchive<File>,
+    path: &str,
+) -> Result<String, String> {
+    let mut entry = archive
+        .by_name(path)
+        .map_err(|error| format!("could not read cover asset {path}: {error}"))?;
+    let mut bytes = Vec::new();
+    entry
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("could not read cover asset {path}: {error}"))?;
+    let mime = mime_guess::from_path(path).first_or_octet_stream();
+    let encoded = general_purpose::STANDARD.encode(bytes);
+    Ok(format!("data:{mime};base64,{encoded}"))
+}
+
+fn is_image_path(path: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| {
+            matches!(
+                extension.to_lowercase().as_str(),
+                "png" | "jpg" | "jpeg" | "gif" | "svg" | "webp"
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn normalize_zip_path(path: &str) -> String {
@@ -736,6 +827,11 @@ mod tests {
         assert!(payload.assets[0]
             .data_url
             .starts_with("data:image/png;base64,"));
+        assert!(payload
+            .cover_image
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("data:image/png;base64,"));
 
         let _ = std::fs::remove_file(path);
     }
@@ -801,6 +897,7 @@ mod tests {
         assert_eq!(books.len(), 1);
         assert_eq!(books[0].title, "Test Book");
         assert_eq!(books[0].chapter_count, 1);
+        assert!(books[0].cover_image.is_some());
         assert_eq!(themes.len(), 1);
         assert_eq!(themes[0].name, "typora-newsprint");
 
@@ -931,6 +1028,9 @@ mod tests {
         let options = SimpleFileOptions::default();
         zip.start_file("README.md", options).unwrap();
         zip.write_all(b"# Test Book\n\n- [One](chapters/001-One.md)\n")
+            .unwrap();
+        zip.start_file("metadata.json", options).unwrap();
+        zip.write_all(br#"{"cover_asset_path":"assets/pic.png"}"#)
             .unwrap();
         zip.start_file("style.css", options).unwrap();
         zip.write_all(b"body { color: #111827; }\n").unwrap();

@@ -18,6 +18,8 @@ fn converts_synthetic_epub_to_reader_zip() {
 
     let mut zip = ZipArchive::new(File::open(&output).unwrap()).unwrap();
     assert!(zip.by_name("README.md").is_ok());
+    let metadata = read_zip_text(&mut zip, "metadata.json");
+    assert!(metadata.contains("\"cover_asset_path\": \"assets/OEBPS-images-pic.png\""));
     assert!(zip.by_name("style.css").is_ok());
     assert!(zip.by_name("chapters/001-Opening-Chapter.md").is_ok());
     assert!(zip.by_name("assets/OEBPS-images-pic.png").is_ok());
@@ -289,7 +291,7 @@ fn make_epub(path: &Path, declare_asset: bool, include_asset: bool, parent_ref: 
         if parent_ref {
             r#"<item id="img" href="media/pic.png" media-type="image/png"/>"#
         } else {
-            r#"<item id="img" href="images/pic.png" media-type="image/png"/>"#
+            r#"<item id="img" href="images/pic.png" media-type="image/png" properties="cover-image"/>"#
         }
     } else {
         ""

@@ -15,6 +15,7 @@ type LibraryBook = {
   chapter_count: number;
   progress_chapter_path?: string | null;
   modified_ms: number;
+  cover_image?: string | null;
 };
 
 type ThemeEntry = {
@@ -91,6 +92,14 @@ type ReaderState = {
   readerWidthCh: number;
   readerFontSizePx: number;
   settingsOpen: boolean;
+  librarySearch: string;
+  homeDeleteMode: boolean;
+  libraryContextMenu?: {
+    path: string;
+    title: string;
+    x: number;
+    y: number;
+  };
 };
 
 const colorModeStorageKey = 'goosereader:color-mode';
@@ -122,6 +131,8 @@ const state: ReaderState = {
   readerWidthCh: readStoredNumber(readerWidthStorageKey, defaultReaderWidthCh, minReaderWidthCh, maxReaderWidthCh),
   readerFontSizePx: readStoredNumber(readerFontSizeStorageKey, defaultReaderFontSizePx, minReaderFontSizePx, maxReaderFontSizePx),
   settingsOpen: false,
+  librarySearch: '',
+  homeDeleteMode: false,
 };
 const appElement = document.querySelector<HTMLDivElement>('#app');
 if (!appElement) throw new Error('missing #app');
@@ -133,6 +144,10 @@ let suppressNextReaderClickUntil = 0;
 let accumulatedHorizontalWheelDelta = 0;
 let wheelResetTimer: number | undefined;
 let lastWheelNavigationAt = 0;
+let homeLongPressTimer: number | undefined;
+let suppressHomeBookOpenUntil = 0;
+let lastHomeBookPointerType = 'mouse';
+let lastHomeBookPointerAt = 0;
 const appLogoUrl = new URL('./assets/goosereader-logo.png', import.meta.url).href;
 
 applyColorMode(state.colorMode);
@@ -170,17 +185,8 @@ function renderShell(options: { preserveChapterScroll?: boolean } = {}): void {
           </div>
         </div>
 
+        ${sidebarNavigationContent()}
         ${settingsMenuContent()}
-
-        <section class="sidebar-section library-panel" aria-label="Library">
-          <div class="section-heading">
-            <span>Library</span>
-            <button id="refresh-library" class="link-button" type="button">Refresh</button>
-          </div>
-          <p class="folder-hint">${escapeHtml(state.appPaths?.books_dir ?? '~/.config/goosereader/books')}</p>
-          ${state.libraryError ? `<p class="inline-error">${escapeHtml(state.libraryError)}</p>` : ''}
-          ${libraryContent()}
-        </section>
 
         <section class="sidebar-section chapter-panel" aria-label="Chapters">
           <div class="section-heading"><span>Chapters</span></div>
@@ -208,10 +214,28 @@ function renderShell(options: { preserveChapterScroll?: boolean } = {}): void {
           ${readerContent(book, current)}
         </div>
       </section>
+      ${libraryContextMenuContent()}
     </main>
   `;
   document.querySelector<HTMLButtonElement>('#settings-toggle')?.addEventListener('click', () => {
     state.settingsOpen = !state.settingsOpen;
+    renderShell();
+  });
+  document.querySelector<HTMLInputElement>('#library-search')?.addEventListener('input', event => {
+    const input = event.currentTarget as HTMLInputElement;
+    const cursor = input.selectionStart ?? input.value.length;
+    state.librarySearch = input.value;
+    renderShell();
+    requestAnimationFrame(() => {
+      const nextInput = document.querySelector<HTMLInputElement>('#library-search');
+      nextInput?.focus();
+      nextInput?.setSelectionRange(cursor, cursor);
+    });
+  });
+  document.querySelector<HTMLButtonElement>('#home-button')?.addEventListener('click', showHome);
+  document.querySelector<HTMLButtonElement>('#all-books-button')?.addEventListener('click', showHome);
+  document.querySelector<HTMLButtonElement>('#done-delete-mode')?.addEventListener('click', () => {
+    state.homeDeleteMode = false;
     renderShell();
   });
   document.querySelector<HTMLButtonElement>('#color-mode-toggle')?.addEventListener('click', toggleColorMode);
@@ -224,7 +248,28 @@ function renderShell(options: { preserveChapterScroll?: boolean } = {}): void {
   });
   document.querySelectorAll<HTMLButtonElement>('[data-book]').forEach(button => {
     button.addEventListener('click', () => {
+      if (Date.now() <= suppressHomeBookOpenUntil || state.homeDeleteMode || state.libraryContextMenu) return;
       if (button.dataset.book) void openLibraryBook(button.dataset.book);
+    });
+  });
+  document.querySelectorAll<HTMLElement>('[data-home-book-card]').forEach(card => {
+    card.addEventListener('contextmenu', event => {
+      const path = card.dataset.menuBook;
+      const title = card.dataset.menuTitle;
+      if (!path || !title) return;
+      event.preventDefault();
+      if (lastHomeBookPointerType !== 'mouse' && Date.now() - lastHomeBookPointerAt < 1_500) {
+        enterHomeDeleteMode();
+        return;
+      }
+      state.homeDeleteMode = false;
+      state.libraryContextMenu = {
+        path,
+        title,
+        x: event.clientX,
+        y: event.clientY,
+      };
+      renderShell();
     });
   });
   document.querySelectorAll<HTMLButtonElement>('[data-delete-book]').forEach(button => {
@@ -233,6 +278,12 @@ function renderShell(options: { preserveChapterScroll?: boolean } = {}): void {
       const title = button.dataset.deleteTitle;
       if (path && title) void deleteLibraryBook(path, title);
     });
+  });
+  document.querySelector<HTMLButtonElement>('[data-context-delete-book]')?.addEventListener('click', event => {
+    const button = event.currentTarget as HTMLButtonElement;
+    const path = button.dataset.contextDeleteBook;
+    const title = button.dataset.contextDeleteTitle;
+    if (path && title) void deleteLibraryBook(path, title);
   });
   document.querySelectorAll<HTMLButtonElement>('[data-toggle-chapter]').forEach(button => {
     button.addEventListener('click', () => {
@@ -260,6 +311,8 @@ function renderShell(options: { preserveChapterScroll?: boolean } = {}): void {
   document.querySelector<HTMLButtonElement>('#next-chapter')?.addEventListener('click', () => moveChapter(1));
   bindSidebarResize();
   bindReaderSettings();
+  bindHomeBookLongPress();
+  bindLibraryContextMenuDismiss();
   bindReaderGestures();
   bindReaderLinks();
   restoreChapterListScroll();
@@ -329,6 +382,26 @@ function persistReaderSettings(): void {
   }
 }
 
+function sidebarNavigationContent(): string {
+  const isHome = !state.book;
+  return `
+    <nav class="books-nav" aria-label="Main navigation">
+      <label class="search-box" for="library-search">
+        <span class="search-icon" aria-hidden="true">⌕</span>
+        <input id="library-search" type="search" placeholder="Search" value="${escapeHtml(state.librarySearch)}" autocomplete="off" />
+      </label>
+      <button id="home-button" class="nav-item ${isHome ? 'active' : ''}" type="button" ${isHome ? 'aria-current="page"' : ''}>
+        <span class="nav-icon" aria-hidden="true">⌂</span>
+        <span>Home</span>
+      </button>
+      <button id="all-books-button" class="nav-item" type="button">
+        <span class="nav-icon" aria-hidden="true">▥</span>
+        <span>All Books</span>
+      </button>
+    </nav>
+  `;
+}
+
 function settingsMenuContent(): string {
   if (!state.settingsOpen) return '';
   return `
@@ -370,43 +443,158 @@ function settingsMenuContent(): string {
   `;
 }
 
-function readerToolbarContent(book: BookPayload | undefined, chapter: BookChapter | undefined): string {
+function libraryContextMenuContent(): string {
+  const menu = state.libraryContextMenu;
+  if (!menu) return '';
+  const left = Math.max(8, Math.min(window.innerWidth - 180, menu.x));
+  const top = Math.max(8, Math.min(window.innerHeight - 64, menu.y));
   return `
-    <header class="reader-toolbar" aria-label="Reader toolbar">
-      <span class="reader-toolbar-title">${escapeHtml(book?.title ?? 'goosereader')}</span>
-      <span class="reader-toolbar-subtitle">${escapeHtml(chapter?.title ?? 'No book loaded')}</span>
-    </header>
-  `;
-}
-
-function libraryContent(): string {
-  if (state.libraryLoading) {
-    return '<div class="library-empty">Loading books…</div>';
-  }
-  if (state.library.length === 0) {
-    return '<div class="library-empty">No .zmd books yet. Import an EPUB to add it here.</div>';
-  }
-  return `
-    <div class="book-list">
-      ${state.library.map(book => `
-        <div class="book-item ${book.path === state.selectedBookPath ? 'active' : ''}">
-          <button class="book-button ${book.path === state.selectedBookPath ? 'active' : ''}" type="button" data-book="${escapeHtml(book.path)}" ${state.loading || Boolean(state.deletingBookPath) ? 'disabled' : ''}>
-            <span class="book-button-title">${escapeHtml(state.loading && book.path === state.selectedBookPath ? 'Opening…' : book.title)}</span>
-            <span class="book-button-meta">${escapeHtml(bookMeta(book))}</span>
-          </button>
-          <button class="delete-book-button" type="button" data-delete-book="${escapeHtml(book.path)}" data-delete-title="${escapeHtml(book.title)}" ${state.deletingBookPath ? 'disabled' : ''} aria-label="Delete ${escapeHtml(book.title)}">
-            ${state.deletingBookPath === book.path ? 'Deleting…' : 'Delete'}
-          </button>
-        </div>
-      `).join('')}
+    <div class="library-context-menu" role="menu" style="left: ${left}px; top: ${top}px">
+      <button class="context-menu-item danger" type="button" role="menuitem" data-context-delete-book="${escapeHtml(menu.path)}" data-context-delete-title="${escapeHtml(menu.title)}">
+        Delete Book
+      </button>
     </div>
   `;
 }
 
-function bookMeta(book: LibraryBook): string {
-  const chapterLabel = `${book.chapter_count} chapter${book.chapter_count === 1 ? '' : 's'}`;
-  const progressLabel = book.progress_chapter_path ? ' · progress saved' : '';
-  return `${book.file_name} · ${chapterLabel}${progressLabel}`;
+function readerToolbarContent(book: BookPayload | undefined, chapter: BookChapter | undefined): string {
+  const visibleBooks = filteredLibrary();
+  return `
+    <header class="reader-toolbar" aria-label="Reader toolbar">
+      <span class="reader-toolbar-title">${escapeHtml(book?.title ?? 'Home')}</span>
+      <span class="reader-toolbar-subtitle">${escapeHtml(chapter?.title ?? `${visibleBooks.length} book${visibleBooks.length === 1 ? '' : 's'}`)}</span>
+    </header>
+  `;
+}
+
+function filteredLibrary(): LibraryBook[] {
+  const query = state.librarySearch.trim().toLocaleLowerCase();
+  if (!query) return state.library;
+  return state.library.filter(book => {
+    const title = book.title.toLocaleLowerCase();
+    const fileName = book.file_name.toLocaleLowerCase();
+    return title.includes(query) || fileName.includes(query);
+  });
+}
+
+function showHome(): void {
+  renderedChapterCache.clear();
+  state.book = undefined;
+  state.selectedBookPath = undefined;
+  state.selectedPath = undefined;
+  state.pendingFragment = undefined;
+  state.expandedChapterPaths = new Set();
+  state.chapterListScrollTop = 0;
+  state.error = undefined;
+  state.libraryContextMenu = undefined;
+  renderShell({ preserveChapterScroll: false });
+}
+
+function homeContent(): string {
+  const books = filteredLibrary();
+  const continueBooks = books.filter(book => Boolean(book.progress_chapter_path));
+  const recentBooks = [...books].sort((left, right) => right.modified_ms - left.modified_ms).slice(0, 10);
+  return `
+    <section class="home-view" aria-label="Library home">
+      <header class="home-header">
+        <div>
+          <span class="home-kicker">Local EPUB Library</span>
+          <h2>Home</h2>
+        </div>
+        <div class="home-header-actions">
+          <span class="home-count">${books.length} book${books.length === 1 ? '' : 's'}</span>
+          ${state.homeDeleteMode ? '<button id="done-delete-mode" class="link-button refresh-home-button" type="button">Done</button>' : ''}
+          <button id="refresh-library" class="link-button refresh-home-button" type="button">Refresh</button>
+        </div>
+      </header>
+      ${state.libraryError ? `<p class="inline-error home-error">${escapeHtml(state.libraryError)}</p>` : ''}
+      ${homeIntroContent(books)}
+      ${bookShelf('Continue', continueBooks, 'Pick up saved books where you left off.', 'continue')}
+      ${bookShelf('Recently Added', recentBooks, 'Your newest imports.', 'cover')}
+      ${bookShelf('Library', books, 'All local books.', 'cover')}
+    </section>
+  `;
+}
+
+function homeIntroContent(books: LibraryBook[]): string {
+  if (state.libraryLoading) {
+    return '<div class="home-empty-card">Loading your library…</div>';
+  }
+  if (state.library.length === 0) {
+    return `
+      <div class="home-empty-card">
+        <strong>Build your bookshelf</strong>
+        <span>Import EPUB files and goosereader will show them here as horizontal shelves.</span>
+      </div>
+    `;
+  }
+  if (books.length === 0) {
+    return `
+      <div class="home-empty-card">
+        <strong>No matching books</strong>
+        <span>Clear the sidebar search to show your full library.</span>
+      </div>
+    `;
+  }
+  return '';
+}
+
+function bookShelf(title: string, books: LibraryBook[], subtitle: string, variant: 'continue' | 'cover'): string {
+  if (books.length === 0) return '';
+  return `
+    <section class="home-section" aria-label="${escapeHtml(title)}">
+      <div class="home-section-heading">
+        <div>
+          <h3>${escapeHtml(title)} <span aria-hidden="true">›</span></h3>
+          <p>${escapeHtml(subtitle)}</p>
+        </div>
+      </div>
+      <div class="home-shelf ${variant === 'continue' ? 'continue-shelf' : ''}">
+        ${books.map(book => bookCard(book, variant)).join('')}
+      </div>
+    </section>
+  `;
+}
+
+function bookCard(book: LibraryBook, variant: 'continue' | 'cover'): string {
+  const progress = book.progress_chapter_path ? 'Progress saved' : `${book.chapter_count} chapter${book.chapter_count === 1 ? '' : 's'}`;
+  return `
+    <div class="home-book-card ${variant} ${state.homeDeleteMode ? 'delete-mode' : ''}" data-home-book-card data-menu-book="${escapeHtml(book.path)}" data-menu-title="${escapeHtml(book.title)}">
+      <button class="home-book-open ${variant}" type="button" data-book="${escapeHtml(book.path)}" ${state.loading || Boolean(state.deletingBookPath) ? 'disabled' : ''}>
+        ${bookCoverContent(book)}
+        <span class="home-book-copy">
+          <span class="home-book-title">${escapeHtml(state.loading && book.path === state.selectedBookPath ? 'Opening…' : book.title)}</span>
+          <span class="home-book-meta">${escapeHtml(progress)}</span>
+        </span>
+      </button>
+      ${state.homeDeleteMode ? `
+        <button class="home-delete-book-button" type="button" data-delete-book="${escapeHtml(book.path)}" data-delete-title="${escapeHtml(book.title)}" ${state.deletingBookPath ? 'disabled' : ''} aria-label="Delete ${escapeHtml(book.title)}" title="Delete ${escapeHtml(book.title)}">
+          ${state.deletingBookPath === book.path ? '…' : '×'}
+        </button>
+      ` : ''}
+    </div>
+  `;
+}
+
+function bookCoverContent(book: LibraryBook): string {
+  if (book.cover_image) {
+    return `<span class="image-cover"><img src="${escapeHtml(book.cover_image)}" alt="" loading="lazy" /></span>`;
+  }
+  return `
+    <span class="generated-cover theme-${bookCoverTheme(book)}" aria-hidden="true">
+      <span class="cover-title">${escapeHtml(book.title)}</span>
+      <span class="cover-mark">zmd</span>
+    </span>
+  `;
+}
+
+function bookCoverTheme(book: LibraryBook): number {
+  const source = `${book.title}\u0000${book.file_name}`;
+  let hash = 0;
+  for (let index = 0; index < source.length; index += 1) {
+    hash = (hash * 31 + source.charCodeAt(index)) >>> 0;
+  }
+  return (hash % 6) + 1;
 }
 
 function chapterListContent(book: BookPayload | undefined): string {
@@ -452,7 +640,7 @@ function readerContent(book: BookPayload | undefined, chapter: BookChapter | und
     return `<div class="error-state"><strong>Could not open book</strong><span>${escapeHtml(state.error)}</span></div>`;
   }
   if (!book || !chapter) {
-    return '<div class="empty-state"><strong>No book loaded</strong><span>Import an EPUB or select a .zmd book from the library.</span></div>';
+    return homeContent();
   }
   const index = book.chapters.findIndex(item => item.path === chapter.path);
   const cached = renderedChapterCache.get(chapterCacheKey(book, chapter));
@@ -620,7 +808,11 @@ async function openLibraryBook(path: string): Promise<void> {
 }
 
 async function deleteLibraryBook(path: string, title: string): Promise<void> {
-  if (!window.confirm(`Delete "${title}" from your goosereader library? This removes the local .zmd file.`)) return;
+  state.libraryContextMenu = undefined;
+  if (!window.confirm(`Delete "${title}" from your goosereader library? This removes the local .zmd file.`)) {
+    renderShell();
+    return;
+  }
   state.deletingBookPath = path;
   state.libraryError = undefined;
   renderShell();
@@ -856,6 +1048,60 @@ function clampSidebarWidth(width: number): number {
   return Math.round(Math.min(viewportMax, Math.max(minSidebarWidth, width)));
 }
 
+function bindHomeBookLongPress(): void {
+  clearHomeLongPressTimer();
+  document.querySelectorAll<HTMLButtonElement>('.home-book-open[data-book]').forEach(button => {
+    let startX = 0;
+    let startY = 0;
+    const cancelLongPress = (): void => clearHomeLongPressTimer();
+
+    button.addEventListener('pointerdown', event => {
+      lastHomeBookPointerType = event.pointerType;
+      lastHomeBookPointerAt = Date.now();
+      if (!event.isPrimary || event.pointerType === 'mouse' || state.homeDeleteMode) return;
+      startX = event.clientX;
+      startY = event.clientY;
+      clearHomeLongPressTimer();
+      homeLongPressTimer = window.setTimeout(() => {
+        enterHomeDeleteMode();
+      }, 620);
+    });
+
+    button.addEventListener('pointermove', event => {
+      if (!homeLongPressTimer) return;
+      const moved = Math.hypot(event.clientX - startX, event.clientY - startY);
+      if (moved > 10) cancelLongPress();
+    });
+    button.addEventListener('pointerup', cancelLongPress);
+    button.addEventListener('pointercancel', cancelLongPress);
+    button.addEventListener('pointerleave', cancelLongPress);
+  });
+}
+
+function enterHomeDeleteMode(): void {
+  clearHomeLongPressTimer();
+  suppressHomeBookOpenUntil = Date.now() + 800;
+  state.libraryContextMenu = undefined;
+  state.homeDeleteMode = true;
+  renderShell();
+}
+
+function clearHomeLongPressTimer(): void {
+  if (!homeLongPressTimer) return;
+  window.clearTimeout(homeLongPressTimer);
+  homeLongPressTimer = undefined;
+}
+
+function bindLibraryContextMenuDismiss(): void {
+  if (!state.libraryContextMenu) return;
+  document.querySelector<HTMLElement>('.shell')?.addEventListener('click', event => {
+    const target = event.target;
+    if (!(target instanceof Element) || target.closest('.library-context-menu')) return;
+    state.libraryContextMenu = undefined;
+    renderShell();
+  });
+}
+
 function bindReaderSettings(): void {
   const widthInput = document.querySelector<HTMLInputElement>('#reader-width');
   const widthValue = document.querySelector<HTMLOutputElement>('#reader-width-value');
@@ -940,14 +1186,31 @@ function scrollReaderPaneToTop(): void {
 
 function handleReaderLink(event: MouseEvent, anchor: HTMLAnchorElement): void {
   const href = anchor.getAttribute('href') ?? '';
-  if (/^https?:\/\//i.test(href)) return;
+  if (isExternalReaderLink(href)) return;
+  event.preventDefault();
   const [targetPath, fragment] = href.split('#');
   const current = currentChapter();
   const resolved = targetPath ? resolveBookPath(targetPath, current?.path ?? '') : current?.path;
-  const target = state.book?.chapters.find(chapter => chapter.path === resolved);
+  const target = findChapterByPath(resolved);
   if (!target) return;
-  event.preventDefault();
   selectChapter(target.path, { fragment });
+}
+
+function isExternalReaderLink(href: string): boolean {
+  return /^https?:\/\//i.test(href) || /^mailto:/i.test(href);
+}
+
+function findChapterByPath(path: string | undefined): BookChapter | undefined {
+  if (!path) return undefined;
+  return state.book?.chapters.find(chapter => chapter.path === path || chapter.path === decodeUriPath(path));
+}
+
+function decodeUriPath(path: string): string {
+  try {
+    return decodeURI(path);
+  } catch {
+    return path;
+  }
 }
 
 function bindReaderLinks(scope: ParentNode = document): void {

@@ -37,6 +37,7 @@ struct ManifestItem {
     href: String,
     media_type: String,
     absolute_path: String,
+    properties: String,
 }
 
 #[derive(Debug, Clone)]
@@ -61,6 +62,7 @@ struct EpubPackage {
     spine: Vec<SpineItem>,
     metadata: Metadata,
     nav_points: Vec<NavPoint>,
+    cover_image_path: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -161,6 +163,26 @@ impl AssetMapper {
         Ok(Some(markdown_path))
     }
 
+    fn copy_asset_at_path_if_present(
+        &mut self,
+        absolute_path: &str,
+        entries: &HashMap<String, Vec<u8>>,
+    ) -> Option<String> {
+        if let Some(existing) = self.archive_asset_path_for_epub_path(absolute_path) {
+            return Some(existing);
+        }
+        let bytes = entries.get(absolute_path)?;
+        let file_name = self.unique_file_name(absolute_path);
+        let markdown_path = format!("../assets/{file_name}");
+        self.href_to_markdown_path
+            .insert(absolute_path.to_string(), markdown_path.clone());
+        self.copied_assets.push(AssetData {
+            path: format!("assets/{file_name}"),
+            bytes: bytes.clone(),
+        });
+        Some(markdown_path.trim_start_matches("../").to_string())
+    }
+
     fn markdown_path(&self, href: &str, content_base_directory: &str) -> Option<String> {
         let no_fragment = remove_fragment(href);
         let absolute = normalize_path(&join_path(content_base_directory, &no_fragment));
@@ -168,6 +190,12 @@ impl AssetMapper {
             .get(&absolute)
             .or_else(|| self.href_to_markdown_path.get(&no_fragment))
             .cloned()
+    }
+
+    fn archive_asset_path_for_epub_path(&self, epub_path: &str) -> Option<String> {
+        self.href_to_markdown_path
+            .get(epub_path)
+            .map(|path| path.trim_start_matches("../").to_string())
     }
 
     fn unique_file_name(&mut self, path: &str) -> String {
@@ -295,6 +323,11 @@ pub fn convert_epub_to_zip(
 
     let mut asset_mapper = AssetMapper::default();
     asset_mapper.copy_assets_from_manifest(&package, &entries);
+    let cover_asset_path = package.cover_image_path.as_ref().and_then(|epub_path| {
+        asset_mapper
+            .archive_asset_path_for_epub_path(epub_path)
+            .or_else(|| asset_mapper.copy_asset_at_path_if_present(epub_path, &entries))
+    });
     for chapter in &chapters {
         ensure_referenced_images_are_available(
             &chapter.data,
@@ -347,6 +380,12 @@ pub fn convert_epub_to_zip(
     zip.write_all(readme(&package, &output_chapters).as_bytes())
         .map_err(|error| {
             ConversionError::FileSystem(format!("could not write README.md: {error}"))
+        })?;
+    zip.start_file("metadata.json", options)
+        .map_err(zip_error("could not add metadata.json"))?;
+    zip.write_all(metadata_json(&package, cover_asset_path.as_deref()).as_bytes())
+        .map_err(|error| {
+            ConversionError::FileSystem(format!("could not write metadata.json: {error}"))
         })?;
     zip.start_file("style.css", options)
         .map_err(zip_error("could not add style.css"))?;
@@ -463,6 +502,7 @@ fn parse_package(entries: &HashMap<String, Vec<u8>>) -> Result<EpubPackage, Conv
                 href: href.to_string(),
                 media_type,
                 absolute_path,
+                properties: item.attribute("properties").unwrap_or("").to_lowercase(),
             },
         );
     }
@@ -497,6 +537,7 @@ fn parse_package(entries: &HashMap<String, Vec<u8>>) -> Result<EpubPackage, Conv
     }
 
     let nav_points = parse_navigation_points(entries, &manifest, &opf_doc, &base_directory);
+    let cover_image_path = find_cover_image_path(entries, &manifest, &opf_doc, &base_directory);
 
     Ok(EpubPackage {
         title,
@@ -504,6 +545,7 @@ fn parse_package(entries: &HashMap<String, Vec<u8>>) -> Result<EpubPackage, Conv
         spine,
         metadata,
         nav_points,
+        cover_image_path,
     })
 }
 
@@ -578,6 +620,83 @@ fn parse_navigation_points(
     parse_inline_navigation_hrefs(opf_doc, opf_base_directory)
 }
 
+fn find_cover_image_path(
+    entries: &HashMap<String, Vec<u8>>,
+    manifest: &HashMap<String, ManifestItem>,
+    opf_doc: &Document<'_>,
+    opf_base_directory: &str,
+) -> Option<String> {
+    if let Some(item) = manifest.values().find(|item| {
+        item.properties
+            .split_whitespace()
+            .any(|property| property == "cover-image")
+            && is_asset(item)
+    }) {
+        return Some(item.absolute_path.clone());
+    }
+
+    if let Some(cover_id) = opf_doc
+        .descendants()
+        .find(|node| {
+            node.is_element()
+                && node.tag_name().name() == "meta"
+                && node
+                    .attribute("name")
+                    .is_some_and(|name| name.eq_ignore_ascii_case("cover"))
+        })
+        .and_then(|node| node.attribute("content"))
+    {
+        if let Some(item) = manifest.get(cover_id) {
+            if is_asset(item) {
+                return Some(item.absolute_path.clone());
+            }
+            if is_xhtml_item(item) {
+                return first_image_in_xhtml(entries, &item.absolute_path);
+            }
+        }
+    }
+
+    for reference in opf_doc.descendants().filter(|node| {
+        node.is_element()
+            && node.tag_name().name() == "reference"
+            && node
+                .attribute("type")
+                .is_some_and(|value| value.eq_ignore_ascii_case("cover"))
+    }) {
+        let Some(href) = reference.attribute("href") else {
+            continue;
+        };
+        let cover_page_path =
+            normalize_path(&join_path(opf_base_directory, &remove_fragment(href)));
+        if let Some(image_path) = first_image_in_xhtml(entries, &cover_page_path) {
+            return Some(image_path);
+        }
+    }
+
+    None
+}
+
+fn first_image_in_xhtml(entries: &HashMap<String, Vec<u8>>, xhtml_path: &str) -> Option<String> {
+    let data = entries.get(xhtml_path)?;
+    let text = std::str::from_utf8(data).ok()?;
+    let content = strip_doctype(text);
+    let doc = Document::parse(&content).ok()?;
+    let src = doc
+        .descendants()
+        .find(|node| node.is_element() && node.tag_name().name() == "img")
+        .and_then(|node| node.attribute("src"))
+        .filter(|src| !src.trim().is_empty())?;
+    Some(normalize_path(&join_path(
+        &parent_dir(xhtml_path),
+        &remove_fragment(src),
+    )))
+}
+
+fn is_xhtml_item(item: &ManifestItem) -> bool {
+    let media_type = item.media_type.to_lowercase();
+    media_type.contains("xhtml") || item.href.to_lowercase().ends_with(".xhtml")
+}
+
 fn navigation_points_from_items(
     entries: &HashMap<String, Vec<u8>>,
     navigation_items: &[ManifestItem],
@@ -609,17 +728,8 @@ fn navigation_points_from_items(
     points
 }
 
-fn manifest_item_properties(item: &ManifestItem, opf_doc: &Document<'_>) -> String {
-    opf_doc
-        .descendants()
-        .find(|node| {
-            node.is_element()
-                && node.tag_name().name() == "item"
-                && node.attribute("href") == Some(item.href.as_str())
-        })
-        .and_then(|node| node.attribute("properties"))
-        .unwrap_or("")
-        .to_lowercase()
+fn manifest_item_properties(item: &ManifestItem, _opf_doc: &Document<'_>) -> String {
+    item.properties.clone()
 }
 
 fn parse_ncx_points(text: &str, base_directory: &str) -> Vec<NavPoint> {
@@ -1628,6 +1738,35 @@ fn readme(package: &EpubPackage, chapters: &[(String, String, String)]) -> Strin
     }
     readme.push_str("\n## Reading style\n\nIf your Markdown viewer supports custom stylesheets, use `style.css` for a higher-contrast book-like reading view.\n");
     readme
+}
+
+fn metadata_json(package: &EpubPackage, cover_asset_path: Option<&str>) -> String {
+    let cover = cover_asset_path
+        .map(|path| format!("\"{}\"", json_escape(path)))
+        .unwrap_or_else(|| "null".to_string());
+    format!(
+        "{{\n  \"title\": \"{}\",\n  \"cover_asset_path\": {}\n}}\n",
+        json_escape(&package.title),
+        cover
+    )
+}
+
+fn json_escape(value: &str) -> String {
+    let mut output = String::new();
+    for character in value.chars() {
+        match character {
+            '"' => output.push_str("\\\""),
+            '\\' => output.push_str("\\\\"),
+            '\n' => output.push_str("\\n"),
+            '\r' => output.push_str("\\r"),
+            '\t' => output.push_str("\\t"),
+            character if character.is_control() => {
+                output.push_str(&format!("\\u{:04x}", character as u32));
+            }
+            character => output.push(character),
+        }
+    }
+    output
 }
 
 fn reader_style() -> &'static str {
