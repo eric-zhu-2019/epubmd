@@ -117,7 +117,16 @@ select:disabled {
 }
 
 .brand-copy {
+  flex: 1 1 auto;
   min-width: 0;
+}
+
+.brand-title-row {
+  align-items: center;
+  display: flex;
+  gap: 0.45rem;
+  min-width: 0;
+  width: 100%;
 }
 
 .brand-logo {
@@ -130,9 +139,11 @@ select:disabled {
 }
 
 .brand h1 {
+  flex: 1 1 auto;
   font-size: 1.3rem;
   line-height: 1.05;
   margin: 0;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -150,24 +161,22 @@ select:disabled {
 }
 
 .brand-actions {
-  align-items: stretch;
-  display: grid;
-  gap: 0.5rem;
-  grid-template-columns: minmax(0, 0.8fr) minmax(0, 1.2fr);
+  display: flex;
 }
 
 .color-mode-toggle {
   align-items: center;
   background: var(--surface-strong);
   border: 1px solid var(--border-strong);
+  border-radius: 999px;
   color: var(--primary);
   display: inline-flex;
-  gap: 0.45rem;
+  flex: 0 0 auto;
   justify-content: center;
   line-height: 1.05;
-  min-width: 0;
-  padding: 0.62rem 0.7rem;
-  white-space: nowrap;
+  min-height: 1.85rem;
+  padding: 0;
+  width: 1.85rem;
 }
 
 .color-mode-toggle:hover {
@@ -175,13 +184,13 @@ select:disabled {
 }
 
 .toggle-icon {
-  font-size: 0.9rem;
+  font-size: 0.95rem;
   line-height: 1;
 }
 
 .import-button {
   align-self: stretch;
-  flex: 0 0 auto;
+  flex: 1 1 auto;
   line-height: 1.05;
   max-width: none;
   min-width: 0;
@@ -534,11 +543,6 @@ select:disabled {
     font-size: 0.7rem;
   }
 
-  .brand-actions {
-    grid-template-columns: 1fr;
-  }
-
-  .color-mode-toggle,
   .import-button {
     max-width: none;
     min-width: 0;

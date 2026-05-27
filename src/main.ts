@@ -133,15 +133,16 @@ function renderShell(options: { preserveChapterScroll?: boolean } = {}): void {
           <div class="brand-lockup">
             <img class="brand-logo" src="${appLogoUrl}" alt="" aria-hidden="true" />
             <div class="brand-copy">
-              <h1>goosereader</h1>
+              <div class="brand-title-row">
+                <h1>goosereader</h1>
+                <button id="color-mode-toggle" class="color-mode-toggle" type="button" aria-pressed="${state.colorMode === 'dark'}" aria-label="Switch to ${state.colorMode === 'dark' ? 'daylight' : 'dark'} mode" title="${state.colorMode === 'dark' ? 'Dark mode' : 'Daylight mode'}">
+                  <span class="toggle-icon" aria-hidden="true">${state.colorMode === 'dark' ? '☾' : '☀'}</span>
+                </button>
+              </div>
               <span class="brand-subtitle">Markdown goose reader</span>
             </div>
           </div>
           <div class="brand-actions">
-            <button id="color-mode-toggle" class="color-mode-toggle" type="button" aria-pressed="${state.colorMode === 'dark'}" aria-label="Switch to ${state.colorMode === 'dark' ? 'daylight' : 'dark'} mode">
-              <span class="toggle-icon" aria-hidden="true">${state.colorMode === 'dark' ? '☾' : '☀'}</span>
-              <span>${state.colorMode === 'dark' ? 'Dark' : 'Daylight'}</span>
-            </button>
             <button id="import-epub" class="import-button" type="button" ${state.importing || state.loading ? 'disabled' : ''}>${state.importing ? 'Importing…' : 'Import EPUB'}</button>
           </div>
         </div>
@@ -338,7 +339,7 @@ function readerContent(book: BookPayload | undefined, chapter: BookChapter | und
   const cached = renderedChapterCache.get(chapterCacheKey(book, chapter));
   return `
     <article class="reader-card" aria-label="Reader chapter. Swipe left or right to change chapters.">
-      <style>${styleTagContent(scopeReaderCss(book.style_css) + "\n" + scopeReaderCss(state.themeCss ?? ''))}</style>
+      <style>${styleTagContent(scopeReaderCss(book.style_css) + "\n" + scopeReaderCss(state.themeCss ?? '') + "\n" + readerColorModeCss())}</style>
       <div class="book-content" data-render-chapter="${escapeHtml(chapter.path)}">${cached ?? loadingChapterMarkup(chapter)}</div>
       <div class="reader-nav" aria-label="Reader chapter navigation">
         <button id="previous-chapter" type="button" ${index <= 0 ? 'disabled' : ''}>Previous</button>
@@ -349,6 +350,46 @@ function readerContent(book: BookPayload | undefined, chapter: BookChapter | und
         <button id="next-chapter" type="button" ${index >= book.chapters.length - 1 ? 'disabled' : ''}>Next</button>
       </div>
     </article>
+  `;
+}
+
+function readerColorModeCss(): string {
+  if (state.colorMode !== 'dark') return '';
+  return `
+    html[data-color-mode="dark"] .reader-card,
+    html[data-color-mode="dark"] .reader-card .book-content {
+      background: var(--reader-surface) !important;
+      color: var(--reader-text) !important;
+    }
+
+    html[data-color-mode="dark"] .reader-card .book-content h1,
+    html[data-color-mode="dark"] .reader-card .book-content h2,
+    html[data-color-mode="dark"] .reader-card .book-content h3,
+    html[data-color-mode="dark"] .reader-card .book-content h4,
+    html[data-color-mode="dark"] .reader-card .book-content h5,
+    html[data-color-mode="dark"] .reader-card .book-content h6,
+    html[data-color-mode="dark"] .reader-card .book-content p,
+    html[data-color-mode="dark"] .reader-card .book-content li,
+    html[data-color-mode="dark"] .reader-card .book-content blockquote,
+    html[data-color-mode="dark"] .reader-card .book-content table,
+    html[data-color-mode="dark"] .reader-card .book-content td,
+    html[data-color-mode="dark"] .reader-card .book-content th {
+      color: var(--reader-text) !important;
+    }
+
+    html[data-color-mode="dark"] .reader-card .book-content a {
+      color: var(--link) !important;
+    }
+
+    html[data-color-mode="dark"] .reader-card .book-content pre,
+    html[data-color-mode="dark"] .reader-card .book-content code {
+      background: #0b1220 !important;
+      color: #eef3fb !important;
+    }
+
+    html[data-color-mode="dark"] .reader-card .book-content blockquote {
+      border-left-color: var(--border-strong) !important;
+    }
   `;
 }
 
