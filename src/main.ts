@@ -87,9 +87,25 @@ type ReaderState = {
   chapterListScrollTop: number;
   renderToken: number;
   colorMode: ColorMode;
+  sidebarWidth: number;
+  readerWidthCh: number;
+  readerFontSizePx: number;
+  settingsOpen: boolean;
 };
 
 const colorModeStorageKey = 'goosereader:color-mode';
+const sidebarWidthStorageKey = 'goosereader:sidebar-width';
+const readerWidthStorageKey = 'goosereader:reader-width-ch';
+const readerFontSizeStorageKey = 'goosereader:reader-font-size-px';
+const defaultSidebarWidth = 320;
+const minSidebarWidth = 260;
+const maxSidebarWidth = 560;
+const defaultReaderWidthCh = 78;
+const minReaderWidthCh = 52;
+const maxReaderWidthCh = 110;
+const defaultReaderFontSizePx = 17;
+const minReaderFontSizePx = 14;
+const maxReaderFontSizePx = 24;
 
 const state: ReaderState = {
   library: [],
@@ -102,6 +118,10 @@ const state: ReaderState = {
   chapterListScrollTop: 0,
   renderToken: 0,
   colorMode: readStoredColorMode(),
+  sidebarWidth: readStoredSidebarWidth(),
+  readerWidthCh: readStoredNumber(readerWidthStorageKey, defaultReaderWidthCh, minReaderWidthCh, maxReaderWidthCh),
+  readerFontSizePx: readStoredNumber(readerFontSizeStorageKey, defaultReaderFontSizePx, minReaderFontSizePx, maxReaderFontSizePx),
+  settingsOpen: false,
 };
 const appElement = document.querySelector<HTMLDivElement>('#app');
 if (!appElement) throw new Error('missing #app');
@@ -127,7 +147,7 @@ function renderShell(options: { preserveChapterScroll?: boolean } = {}): void {
   const book = state.book;
   const current = currentChapter();
   app.innerHTML = `
-    <main class="shell">
+    <main class="shell" style="--sidebar-width: ${state.sidebarWidth}px">
       <aside class="sidebar">
         <div class="brand">
           <div class="brand-lockup">
@@ -135,7 +155,10 @@ function renderShell(options: { preserveChapterScroll?: boolean } = {}): void {
             <div class="brand-copy">
               <div class="brand-title-row">
                 <h1>goosereader</h1>
-                <button id="color-mode-toggle" class="color-mode-toggle" type="button" aria-pressed="${state.colorMode === 'dark'}" aria-label="Switch to ${state.colorMode === 'dark' ? 'daylight' : 'dark'} mode" title="${state.colorMode === 'dark' ? 'Dark mode' : 'Daylight mode'}">
+                <button id="settings-toggle" class="header-icon-button settings-toggle" type="button" aria-expanded="${state.settingsOpen}" aria-controls="settings-menu" aria-label="${state.settingsOpen ? 'Hide' : 'Show'} settings" title="Settings">
+                  <span class="toggle-icon" aria-hidden="true">⚙</span>
+                </button>
+                <button id="color-mode-toggle" class="header-icon-button color-mode-toggle" type="button" aria-pressed="${state.colorMode === 'dark'}" aria-label="Switch to ${state.colorMode === 'dark' ? 'daylight' : 'dark'} mode" title="${state.colorMode === 'dark' ? 'Dark mode' : 'Daylight mode'}">
                   <span class="toggle-icon" aria-hidden="true">${state.colorMode === 'dark' ? '☾' : '☀'}</span>
                 </button>
               </div>
@@ -147,6 +170,8 @@ function renderShell(options: { preserveChapterScroll?: boolean } = {}): void {
           </div>
         </div>
 
+        ${settingsMenuContent()}
+
         <section class="sidebar-section library-panel" aria-label="Library">
           <div class="section-heading">
             <span>Library</span>
@@ -157,22 +182,6 @@ function renderShell(options: { preserveChapterScroll?: boolean } = {}): void {
           ${libraryContent()}
         </section>
 
-        <section class="sidebar-section theme-panel" aria-label="Theme controls">
-          <div class="section-heading">
-            <span>Theme</span>
-            <button id="refresh-themes" class="link-button" type="button">Refresh</button>
-          </div>
-          <p class="folder-hint">${escapeHtml(state.appPaths?.themes_dir ?? '~/.config/goosereader/themes')}</p>
-          <select id="theme-select" class="theme-select" ${state.themeLoading ? 'disabled' : ''}>
-            <option value="">Default archive style</option>
-            ${state.themes.map(theme => `
-              <option value="${escapeHtml(theme.path)}" ${theme.path === state.themePath ? 'selected' : ''}>${escapeHtml(theme.name)}</option>
-            `).join('')}
-          </select>
-          ${state.themeName ? `<span class="theme-name">Using ${escapeHtml(state.themeName)}</span>` : ''}
-          ${state.themeError ? `<span class="theme-error">${escapeHtml(state.themeError)}</span>` : ''}
-        </section>
-
         <section class="sidebar-section chapter-panel" aria-label="Chapters">
           <div class="section-heading"><span>Chapters</span></div>
           <p class="book-title">${escapeHtml(book?.title ?? 'Select a book to start reading.')}</p>
@@ -180,12 +189,31 @@ function renderShell(options: { preserveChapterScroll?: boolean } = {}): void {
             ${chapterListContent(book)}
           </nav>
         </section>
+        <div
+          id="sidebar-resize-handle"
+          class="sidebar-resize-handle"
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="Resize sidebar"
+          aria-valuemin="${minSidebarWidth}"
+          aria-valuemax="${maxSidebarWidth}"
+          aria-valuenow="${state.sidebarWidth}"
+          tabindex="0"
+          title="Drag to resize sidebar"
+        ></div>
       </aside>
       <section class="reader-pane">
-        ${readerContent(book, current)}
+        ${readerToolbarContent(book, current)}
+        <div class="reader-stage">
+          ${readerContent(book, current)}
+        </div>
       </section>
     </main>
   `;
+  document.querySelector<HTMLButtonElement>('#settings-toggle')?.addEventListener('click', () => {
+    state.settingsOpen = !state.settingsOpen;
+    renderShell();
+  });
   document.querySelector<HTMLButtonElement>('#color-mode-toggle')?.addEventListener('click', toggleColorMode);
   document.querySelector<HTMLButtonElement>('#import-epub')?.addEventListener('click', importEpub);
   document.querySelector<HTMLButtonElement>('#refresh-library')?.addEventListener('click', () => void refreshLibrary());
@@ -230,6 +258,8 @@ function renderShell(options: { preserveChapterScroll?: boolean } = {}): void {
   });
   document.querySelector<HTMLButtonElement>('#previous-chapter')?.addEventListener('click', () => moveChapter(-1));
   document.querySelector<HTMLButtonElement>('#next-chapter')?.addEventListener('click', () => moveChapter(1));
+  bindSidebarResize();
+  bindReaderSettings();
   bindReaderGestures();
   bindReaderLinks();
   restoreChapterListScroll();
@@ -258,6 +288,95 @@ function readStoredColorMode(): ColorMode {
   } catch {
     return 'daylight';
   }
+}
+
+function readStoredSidebarWidth(): number {
+  try {
+    const stored = Number(window.localStorage.getItem(sidebarWidthStorageKey));
+    return clampSidebarWidth(Number.isFinite(stored) ? stored : defaultSidebarWidth);
+  } catch {
+    return defaultSidebarWidth;
+  }
+}
+
+function readStoredNumber(key: string, fallback: number, min: number, max: number): number {
+  try {
+    const stored = Number(window.localStorage.getItem(key));
+    return clampNumber(Number.isFinite(stored) ? stored : fallback, min, max);
+  } catch {
+    return fallback;
+  }
+}
+
+function clampNumber(value: number, min: number, max: number): number {
+  return Math.round(Math.min(max, Math.max(min, value)));
+}
+
+function persistSidebarWidth(): void {
+  try {
+    window.localStorage.setItem(sidebarWidthStorageKey, String(Math.round(state.sidebarWidth)));
+  } catch {
+    // Ignore storage failures; the current layout should still update in memory.
+  }
+}
+
+function persistReaderSettings(): void {
+  try {
+    window.localStorage.setItem(readerWidthStorageKey, String(state.readerWidthCh));
+    window.localStorage.setItem(readerFontSizeStorageKey, String(state.readerFontSizePx));
+  } catch {
+    // Ignore storage failures; the current layout should still update in memory.
+  }
+}
+
+function settingsMenuContent(): string {
+  if (!state.settingsOpen) return '';
+  return `
+    <div id="settings-menu" class="settings-menu" role="region" aria-label="Settings">
+      <section class="sidebar-section theme-panel" aria-label="Theme controls">
+        <div class="section-heading">
+          <span>Theme</span>
+          <button id="refresh-themes" class="link-button" type="button">Refresh</button>
+        </div>
+        <p class="folder-hint">${escapeHtml(state.appPaths?.themes_dir ?? '~/.config/goosereader/themes')}</p>
+        <select id="theme-select" class="theme-select" ${state.themeLoading ? 'disabled' : ''}>
+          <option value="">Default archive style</option>
+          ${state.themes.map(theme => `
+            <option value="${escapeHtml(theme.path)}" ${theme.path === state.themePath ? 'selected' : ''}>${escapeHtml(theme.name)}</option>
+          `).join('')}
+        </select>
+        ${state.themeName ? `<span class="theme-name">Using ${escapeHtml(state.themeName)}</span>` : ''}
+        ${state.themeError ? `<span class="theme-error">${escapeHtml(state.themeError)}</span>` : ''}
+      </section>
+
+      <section class="sidebar-section reader-settings-panel" aria-label="Reader settings">
+        <div class="section-heading"><span>Reader</span></div>
+        <label class="reader-setting" for="reader-width">
+          <span class="reader-setting-label">
+            <span>Page width</span>
+            <output id="reader-width-value" for="reader-width">${state.readerWidthCh}ch</output>
+          </span>
+          <input id="reader-width" type="range" min="${minReaderWidthCh}" max="${maxReaderWidthCh}" step="2" value="${state.readerWidthCh}" />
+        </label>
+        <label class="reader-setting" for="reader-font-size">
+          <span class="reader-setting-label">
+            <span>Font size</span>
+            <output id="reader-font-size-value" for="reader-font-size">${state.readerFontSizePx}px</output>
+          </span>
+          <input id="reader-font-size" type="range" min="${minReaderFontSizePx}" max="${maxReaderFontSizePx}" step="1" value="${state.readerFontSizePx}" />
+        </label>
+      </section>
+    </div>
+  `;
+}
+
+function readerToolbarContent(book: BookPayload | undefined, chapter: BookChapter | undefined): string {
+  return `
+    <header class="reader-toolbar" aria-label="Reader toolbar">
+      <span class="reader-toolbar-title">${escapeHtml(book?.title ?? 'goosereader')}</span>
+      <span class="reader-toolbar-subtitle">${escapeHtml(chapter?.title ?? 'No book loaded')}</span>
+    </header>
+  `;
 }
 
 function libraryContent(): string {
@@ -338,8 +457,8 @@ function readerContent(book: BookPayload | undefined, chapter: BookChapter | und
   const index = book.chapters.findIndex(item => item.path === chapter.path);
   const cached = renderedChapterCache.get(chapterCacheKey(book, chapter));
   return `
-    <article class="reader-card" aria-label="Reader chapter. Swipe left or right to change chapters.">
-      <style>${styleTagContent(scopeReaderCss(book.style_css) + "\n" + scopeReaderCss(state.themeCss ?? '') + "\n" + readerColorModeCss())}</style>
+    <article class="reader-card" style="${readerPreferenceStyle()}" aria-label="Reader chapter. Swipe left or right to change chapters.">
+      <style>${styleTagContent(scopeReaderCss(book.style_css) + "\n" + scopeReaderCss(state.themeCss ?? '') + "\n" + readerPreferenceCss() + "\n" + readerColorModeCss())}</style>
       <div class="book-content" data-render-chapter="${escapeHtml(chapter.path)}">${cached ?? loadingChapterMarkup(chapter)}</div>
       <div class="reader-nav" aria-label="Reader chapter navigation">
         <button id="previous-chapter" type="button" ${index <= 0 ? 'disabled' : ''}>Previous</button>
@@ -350,6 +469,27 @@ function readerContent(book: BookPayload | undefined, chapter: BookChapter | und
         <button id="next-chapter" type="button" ${index >= book.chapters.length - 1 ? 'disabled' : ''}>Next</button>
       </div>
     </article>
+  `;
+}
+
+function readerPreferenceStyle(): string {
+  return `--reader-content-width: ${state.readerWidthCh}ch; --reader-font-size: ${state.readerFontSizePx}px`;
+}
+
+function readerPreferenceCss(): string {
+  return `
+    .reader-card .book-content {
+      max-width: var(--reader-content-width) !important;
+      font-size: var(--reader-font-size) !important;
+    }
+
+    .reader-card .book-content p,
+    .reader-card .book-content li,
+    .reader-card .book-content blockquote,
+    .reader-card .book-content td,
+    .reader-card .book-content th {
+      font-size: inherit !important;
+    }
   `;
 }
 
@@ -656,6 +796,91 @@ function restoreChapterListScroll(): void {
   const chapterList = document.querySelector<HTMLElement>('.chapter-list');
   if (!chapterList) return;
   chapterList.scrollTop = state.chapterListScrollTop;
+}
+
+function bindSidebarResize(): void {
+  const handle = document.querySelector<HTMLElement>('#sidebar-resize-handle');
+  const shell = document.querySelector<HTMLElement>('.shell');
+  if (!handle || !shell) return;
+
+  const applyWidth = (width: number): void => {
+    const clamped = clampSidebarWidth(width);
+    state.sidebarWidth = clamped;
+    shell.style.setProperty('--sidebar-width', `${clamped}px`);
+    handle.setAttribute('aria-valuenow', String(clamped));
+  };
+
+  handle.addEventListener('pointerdown', event => {
+    if (!event.isPrimary || event.button !== 0) return;
+    event.preventDefault();
+    handle.setPointerCapture(event.pointerId);
+    document.body.classList.add('is-resizing-sidebar');
+
+    const resizeTo = (clientX: number): void => {
+      const shellLeft = shell.getBoundingClientRect().left;
+      applyWidth(clientX - shellLeft);
+    };
+    const onPointerMove = (moveEvent: PointerEvent): void => {
+      if (!moveEvent.isPrimary) return;
+      resizeTo(moveEvent.clientX);
+    };
+    const finishResize = (): void => {
+      document.removeEventListener('pointermove', onPointerMove);
+      document.removeEventListener('pointerup', finishResize);
+      document.removeEventListener('pointercancel', finishResize);
+      document.body.classList.remove('is-resizing-sidebar');
+      persistSidebarWidth();
+    };
+
+    document.addEventListener('pointermove', onPointerMove);
+    document.addEventListener('pointerup', finishResize);
+    document.addEventListener('pointercancel', finishResize);
+  });
+
+  handle.addEventListener('keydown', event => {
+    const step = event.shiftKey ? 40 : 16;
+    let nextWidth: number | undefined;
+    if (event.key === 'ArrowLeft') nextWidth = state.sidebarWidth - step;
+    if (event.key === 'ArrowRight') nextWidth = state.sidebarWidth + step;
+    if (event.key === 'Home') nextWidth = minSidebarWidth;
+    if (event.key === 'End') nextWidth = maxSidebarWidth;
+    if (nextWidth === undefined) return;
+    event.preventDefault();
+    applyWidth(nextWidth);
+    persistSidebarWidth();
+  });
+}
+
+function clampSidebarWidth(width: number): number {
+  const viewportMax = Math.max(minSidebarWidth, Math.min(maxSidebarWidth, Math.floor(window.innerWidth * 0.6)));
+  return Math.round(Math.min(viewportMax, Math.max(minSidebarWidth, width)));
+}
+
+function bindReaderSettings(): void {
+  const widthInput = document.querySelector<HTMLInputElement>('#reader-width');
+  const widthValue = document.querySelector<HTMLOutputElement>('#reader-width-value');
+  const fontSizeInput = document.querySelector<HTMLInputElement>('#reader-font-size');
+  const fontSizeValue = document.querySelector<HTMLOutputElement>('#reader-font-size-value');
+
+  widthInput?.addEventListener('input', () => {
+    state.readerWidthCh = clampNumber(Number(widthInput.value), minReaderWidthCh, maxReaderWidthCh);
+    widthInput.value = String(state.readerWidthCh);
+    if (widthValue) widthValue.value = `${state.readerWidthCh}ch`;
+    applyReaderSettings();
+  });
+  widthInput?.addEventListener('change', persistReaderSettings);
+
+  fontSizeInput?.addEventListener('input', () => {
+    state.readerFontSizePx = clampNumber(Number(fontSizeInput.value), minReaderFontSizePx, maxReaderFontSizePx);
+    fontSizeInput.value = String(state.readerFontSizePx);
+    if (fontSizeValue) fontSizeValue.value = `${state.readerFontSizePx}px`;
+    applyReaderSettings();
+  });
+  fontSizeInput?.addEventListener('change', persistReaderSettings);
+}
+
+function applyReaderSettings(): void {
+  document.querySelector<HTMLElement>('.reader-card')?.setAttribute('style', readerPreferenceStyle());
 }
 
 function bindReaderGestures(): void {
