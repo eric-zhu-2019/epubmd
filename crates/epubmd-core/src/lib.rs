@@ -359,8 +359,13 @@ pub fn convert_epub_to_zip(
         );
         converted_spines.push(markdown);
     }
-    let output_chapters =
-        output_chapters_from_spines(&chapters, &converted_spines, &logical_segments);
+    let output_chapters = output_chapters_from_spines(
+        &chapters,
+        &converted_spines,
+        &logical_segments,
+        &package.nav_points,
+        &chapter_links,
+    );
 
     let file = File::create(&destination)
         .map_err(|error| ConversionError::FileSystem(format!("could not create zip: {error}")))?;
@@ -1283,18 +1288,49 @@ fn logical_chapter_segments(
         .map(|point| point.depth)
         .max()
         .unwrap_or(1);
+    let conservative = usable_logical_segments(build_logical_segments(
+        nav_points,
+        &spine_index_by_path,
+        |point| {
+            if max_depth > 1 {
+                point.depth == 1
+            } else {
+                is_likely_logical_chapter_title(&point.title)
+            }
+        },
+    ));
+    if should_aggressively_split_nav(chapters, nav_points, &conservative) {
+        let aggressive = usable_logical_segments(build_logical_segments(
+            nav_points,
+            &spine_index_by_path,
+            |point| {
+                point.fragment.is_some()
+                    && if max_depth > 1 {
+                        point.depth <= 2
+                    } else {
+                        is_likely_logical_chapter_title(&point.title)
+                    }
+            },
+        ));
+        if aggressive.len() > conservative.len() {
+            return aggressive;
+        }
+    }
+    conservative
+}
+
+fn build_logical_segments(
+    nav_points: &[NavPoint],
+    spine_index_by_path: &HashMap<String, usize>,
+    mut split_here: impl FnMut(&NavPoint) -> bool,
+) -> Vec<LogicalChapterSegment> {
     let mut used_names = HashSet::new();
     let mut segments = Vec::new();
     for (nav_index, point) in nav_points.iter().enumerate() {
         let Some(spine_index) = spine_index_by_path.get(&point.epub_path).copied() else {
             continue;
         };
-        let split_here = if max_depth > 1 {
-            point.depth == 1
-        } else {
-            is_likely_logical_chapter_title(&point.title)
-        };
-        if !split_here {
+        if !split_here(point) {
             continue;
         }
         let mut file_name =
@@ -1318,6 +1354,10 @@ fn logical_chapter_segments(
             },
         });
     }
+    segments
+}
+
+fn usable_logical_segments(segments: Vec<LogicalChapterSegment>) -> Vec<LogicalChapterSegment> {
     if has_ambiguous_segment_boundaries(&segments) {
         return Vec::new();
     }
@@ -1326,6 +1366,29 @@ fn logical_chapter_segments(
     } else {
         segments
     }
+}
+
+fn should_aggressively_split_nav(
+    chapters: &[ChapterData],
+    nav_points: &[NavPoint],
+    conservative_segments: &[LogicalChapterSegment],
+) -> bool {
+    if nav_points.len() < 12 || conservative_segments.len() > 4 {
+        return false;
+    }
+    let max_spine_bytes = chapters
+        .iter()
+        .map(|chapter| chapter.data.len())
+        .max()
+        .unwrap_or(0);
+    if max_spine_bytes < 160_000 {
+        return false;
+    }
+    let mut nav_points_by_path: HashMap<&str, usize> = HashMap::new();
+    for point in nav_points.iter().filter(|point| point.fragment.is_some()) {
+        *nav_points_by_path.entry(&point.epub_path).or_default() += 1;
+    }
+    nav_points_by_path.values().any(|count| *count >= 12)
 }
 
 fn has_ambiguous_segment_boundaries(segments: &[LogicalChapterSegment]) -> bool {
@@ -1625,9 +1688,11 @@ fn output_chapters_from_spines(
     chapters: &[ChapterData],
     converted_spines: &[String],
     segments: &[LogicalChapterSegment],
+    nav_points: &[NavPoint],
+    chapter_links: &ChapterLinkMap,
 ) -> Vec<(String, String, String)> {
-    if segments.is_empty() {
-        return chapters
+    let mut output = if segments.is_empty() {
+        chapters
             .iter()
             .zip(converted_spines.iter())
             .map(|(chapter, converted)| {
@@ -1640,66 +1705,426 @@ fn output_chapters_from_spines(
                     converted.clone(),
                 )
             })
-            .collect();
-    }
-
-    let mut output = Vec::new();
-    for (index, segment) in segments.iter().enumerate() {
-        let next = segments.get(index + 1).map(|segment| &segment.start);
-        let mut pieces = Vec::new();
-        for spine_index in segment.start.spine_index
-            ..=next
-                .map(|target| target.spine_index)
-                .unwrap_or_else(|| converted_spines.len().saturating_sub(1))
-        {
-            let Some(spine) = converted_spines.get(spine_index) else {
-                continue;
-            };
-            let start = if spine_index == segment.start.spine_index {
-                if index == 0 {
-                    0
+            .collect::<Vec<_>>()
+    } else {
+        let mut output = Vec::new();
+        for (index, segment) in segments.iter().enumerate() {
+            let next = segments.get(index + 1).map(|segment| &segment.start);
+            let mut pieces = Vec::new();
+            for spine_index in segment.start.spine_index
+                ..=next
+                    .map(|target| target.spine_index)
+                    .unwrap_or_else(|| converted_spines.len().saturating_sub(1))
+            {
+                let Some(spine) = converted_spines.get(spine_index) else {
+                    continue;
+                };
+                let start = if spine_index == segment.start.spine_index {
+                    if index == 0 {
+                        0
+                    } else {
+                        segment
+                            .start
+                            .fragment
+                            .as_deref()
+                            .and_then(|fragment| anchor_position(spine, fragment))
+                            .unwrap_or(0)
+                    }
                 } else {
-                    segment
-                        .start
-                        .fragment
-                        .as_deref()
-                        .and_then(|fragment| anchor_position(spine, fragment))
-                        .unwrap_or(0)
-                }
-            } else {
-                0
-            };
-            let end = if let Some(next) = next {
-                if spine_index == next.spine_index {
-                    match next.fragment.as_deref() {
-                        Some(fragment) => anchor_position(spine, fragment).unwrap_or(spine.len()),
-                        None => 0,
+                    0
+                };
+                let end = if let Some(next) = next {
+                    if spine_index == next.spine_index {
+                        match next.fragment.as_deref() {
+                            Some(fragment) => {
+                                anchor_position(spine, fragment).unwrap_or(spine.len())
+                            }
+                            None => 0,
+                        }
+                    } else {
+                        spine.len()
                     }
                 } else {
                     spine.len()
+                };
+                if end <= start {
+                    continue;
                 }
-            } else {
-                spine.len()
-            };
-            if end <= start {
-                continue;
+                let piece = spine[start..end].trim();
+                if !piece.is_empty() {
+                    pieces.push(piece.to_string());
+                }
             }
-            let piece = spine[start..end].trim();
-            if !piece.is_empty() {
-                pieces.push(piece.to_string());
+            let mut markdown = pieces.join("\n\n");
+            if markdown.trim().is_empty() {
+                markdown = format!("# {}", segment.title);
             }
+            output.push((
+                segment.file_name.clone(),
+                segment.title.clone(),
+                cleanup(&markdown),
+            ));
         }
-        let mut markdown = pieces.join("\n\n");
-        if markdown.trim().is_empty() {
-            markdown = format!("# {}", segment.title);
-        }
-        output.push((
-            segment.file_name.clone(),
-            segment.title.clone(),
-            cleanup(&markdown),
-        ));
+        output
+    };
+    let targets = plain_toc_link_targets(nav_points, chapter_links, &output);
+    for (_, _, markdown) in &mut output {
+        *markdown = link_plain_frontmatter_toc_entries(markdown, &targets);
     }
     output
+}
+
+fn link_plain_frontmatter_toc_entries(
+    markdown: &str,
+    targets: &HashMap<String, Option<String>>,
+) -> String {
+    if targets.is_empty() {
+        return markdown.to_string();
+    }
+
+    let mut seen_primary_heading = false;
+    let mut active_toc_block = false;
+    let mut list_items_seen = 0usize;
+    let mut done = false;
+    let mut current_top_level_target: Option<String> = None;
+    let mut lines = Vec::new();
+
+    for line in markdown.lines() {
+        let trimmed = line.trim();
+        if done {
+            lines.push(line.to_string());
+            continue;
+        }
+
+        if !seen_primary_heading {
+            seen_primary_heading = trimmed.starts_with("# ");
+            lines.push(line.to_string());
+            continue;
+        }
+
+        if active_toc_block {
+            if is_markdown_list_line(line) {
+                list_items_seen += 1;
+                let linked = link_plain_toc_list_line(line, targets)
+                    .or_else(|| fallback_parent_toc_list_line(line, &current_top_level_target));
+                if list_line_indent(line) == 0 {
+                    if let Some(target) = linked.as_deref().and_then(markdown_link_target) {
+                        current_top_level_target = Some(target);
+                    }
+                }
+                lines.push(linked.unwrap_or_else(|| line.to_string()));
+                continue;
+            }
+            if trimmed.is_empty() || is_standalone_anchor_line(trimmed) {
+                lines.push(line.to_string());
+                continue;
+            }
+            if is_markdown_heading_line(trimmed) {
+                done = true;
+                lines.push(line.to_string());
+                continue;
+            }
+            if list_items_seen >= 3 {
+                done = true;
+            } else {
+                active_toc_block = false;
+                list_items_seen = 0;
+            }
+            lines.push(line.to_string());
+            continue;
+        }
+
+        if is_markdown_subheading_line(trimmed) {
+            done = true;
+            lines.push(line.to_string());
+            continue;
+        }
+
+        if is_markdown_list_line(line) {
+            active_toc_block = true;
+            list_items_seen = 1;
+            let linked = link_plain_toc_list_line(line, targets);
+            if list_line_indent(line) == 0 {
+                if let Some(target) = linked.as_deref().and_then(markdown_link_target) {
+                    current_top_level_target = Some(target);
+                }
+            }
+            lines.push(linked.unwrap_or_else(|| line.to_string()));
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+
+    let mut linked = lines.join("\n");
+    if markdown.ends_with('\n') {
+        linked.push('\n');
+    }
+    linked
+}
+
+fn plain_toc_link_targets(
+    nav_points: &[NavPoint],
+    chapter_links: &ChapterLinkMap,
+    output_chapters: &[(String, String, String)],
+) -> HashMap<String, Option<String>> {
+    let mut targets = HashMap::new();
+    for point in nav_points {
+        let Some(link) = nav_point_markdown_link(point, chapter_links) else {
+            continue;
+        };
+        insert_unique_toc_target(&mut targets, normalize_toc_lookup_text(&point.title), &link);
+        let stripped = strip_leading_section_number(&point.title);
+        insert_unique_toc_target(&mut targets, normalize_toc_lookup_text(&stripped), &link);
+    }
+    insert_heading_toc_targets(&mut targets, output_chapters);
+    targets
+        .into_iter()
+        .filter(|(key, value)| !key.is_empty() && value.is_some())
+        .collect()
+}
+
+fn insert_heading_toc_targets(
+    targets: &mut HashMap<String, Option<String>>,
+    output_chapters: &[(String, String, String)],
+) {
+    for (file_name, _, markdown) in output_chapters {
+        let mut pending_anchor: Option<String> = None;
+        for line in markdown.lines() {
+            let trimmed = line.trim();
+            if let Some(anchor) = standalone_anchor_ids(trimmed).last().cloned() {
+                pending_anchor = Some(anchor);
+                continue;
+            }
+            if let Some(title) = markdown_heading_title(trimmed) {
+                let link = pending_anchor
+                    .as_deref()
+                    .map(|anchor| format!("{file_name}#{anchor}"))
+                    .unwrap_or_else(|| file_name.clone());
+                insert_preferred_toc_target(targets, normalize_toc_lookup_text(&title), &link);
+                let stripped = strip_leading_section_number(&title);
+                insert_preferred_toc_target(targets, normalize_toc_lookup_text(&stripped), &link);
+            }
+            if !trimmed.is_empty() {
+                pending_anchor = None;
+            }
+        }
+    }
+}
+
+fn nav_point_markdown_link(point: &NavPoint, chapter_links: &ChapterLinkMap) -> Option<String> {
+    if let Some(fragment) = point.fragment.as_deref() {
+        let key = format!("{}#{fragment}", point.epub_path);
+        if let Some(link) = chapter_links.epub_path_to_markdown.get(&key) {
+            return Some(link.clone());
+        }
+        if let Some(markdown) = chapter_links.epub_path_to_markdown.get(&point.epub_path) {
+            return Some(format!("{markdown}#{fragment}"));
+        }
+    }
+    chapter_links
+        .epub_path_to_markdown
+        .get(&point.epub_path)
+        .cloned()
+}
+
+fn insert_unique_toc_target(
+    targets: &mut HashMap<String, Option<String>>,
+    key: String,
+    link: &str,
+) {
+    if key.is_empty() {
+        return;
+    }
+    match targets.get_mut(&key) {
+        Some(existing) if existing.as_deref() == Some(link) => {}
+        Some(existing) => *existing = None,
+        None => {
+            targets.insert(key, Some(link.to_string()));
+        }
+    }
+}
+
+fn insert_preferred_toc_target(
+    targets: &mut HashMap<String, Option<String>>,
+    key: String,
+    link: &str,
+) {
+    if key.is_empty() || targets.contains_key(&key) {
+        return;
+    }
+    targets.insert(key, Some(link.to_string()));
+}
+
+fn link_plain_toc_list_line(
+    line: &str,
+    targets: &HashMap<String, Option<String>>,
+) -> Option<String> {
+    let captures = markdown_list_line_captures(line)?;
+    let label = captures.get(3)?.as_str().trim();
+    if label.is_empty() || label.contains("](") {
+        return None;
+    }
+    let (anchor_prefix, link_label) = split_leading_inline_anchors(label);
+    let normalized = normalize_toc_lookup_text(link_label);
+    let marker = captures.get(2).map_or("", |value| value.as_str()).trim();
+    let numbered_label = if marker
+        .chars()
+        .next()
+        .is_some_and(|character| character.is_ascii_digit())
+    {
+        Some(format!("{marker} {link_label}"))
+    } else {
+        None
+    };
+    let target = targets
+        .get(
+            &numbered_label
+                .as_deref()
+                .map(normalize_toc_lookup_text)
+                .unwrap_or_default(),
+        )
+        .and_then(|value| value.as_ref())
+        .or_else(|| targets.get(&normalized).and_then(|value| value.as_ref()))
+        .or_else(|| {
+            let stripped = strip_leading_section_number(link_label);
+            targets
+                .get(&normalize_toc_lookup_text(&stripped))
+                .and_then(|value| value.as_ref())
+        })?;
+    Some(format!(
+        "{}{}{}[{}]({})",
+        captures.get(1).map_or("", |value| value.as_str()),
+        captures.get(2).map_or("", |value| value.as_str()),
+        anchor_prefix,
+        escape_markdown_link_text(link_label),
+        target
+    ))
+}
+
+fn fallback_parent_toc_list_line(line: &str, parent_target: &Option<String>) -> Option<String> {
+    if list_line_indent(line) == 0 {
+        return None;
+    }
+    let target = parent_target.as_ref()?;
+    let captures = markdown_list_line_captures(line)?;
+    let label = captures.get(3)?.as_str().trim();
+    if label.is_empty() || label.contains("](") {
+        return None;
+    }
+    let (anchor_prefix, link_label) = split_leading_inline_anchors(label);
+    Some(format!(
+        "{}{}{}[{}]({})",
+        captures.get(1).map_or("", |value| value.as_str()),
+        captures.get(2).map_or("", |value| value.as_str()),
+        anchor_prefix,
+        escape_markdown_link_text(link_label),
+        target
+    ))
+}
+
+fn markdown_link_target(line: &str) -> Option<String> {
+    let captures = Regex::new(r"\]\(([^)]+)\)")
+        .expect("valid regex")
+        .captures(line)?;
+    Some(captures.get(1)?.as_str().to_string())
+}
+
+fn list_line_indent(line: &str) -> usize {
+    markdown_list_line_captures(line)
+        .and_then(|captures| captures.get(1).map(|value| value.as_str().len()))
+        .unwrap_or(0)
+}
+
+fn is_markdown_list_line(line: &str) -> bool {
+    markdown_list_line_captures(line).is_some()
+}
+
+fn markdown_list_line_captures(line: &str) -> Option<regex::Captures<'_>> {
+    Regex::new(r"^(\s*)([-*+]\s+|\d+[.)]\s+)(.+?)\s*$")
+        .expect("valid regex")
+        .captures(line)
+}
+
+fn split_leading_inline_anchors(label: &str) -> (String, &str) {
+    let mut anchors = String::new();
+    let mut rest = label.trim_start();
+    loop {
+        let trimmed = rest.trim_start();
+        if !trimmed.starts_with("<a ") {
+            return (anchors, trimmed);
+        }
+        let Some(end) = trimmed.find("</a>") else {
+            return (anchors, rest);
+        };
+        let end = end + "</a>".len();
+        anchors.push_str(&trimmed[..end]);
+        anchors.push(' ');
+        rest = &trimmed[end..];
+    }
+}
+
+fn normalize_toc_lookup_text(text: &str) -> String {
+    let without_tags = Regex::new(r"<[^>]+>")
+        .expect("valid regex")
+        .replace_all(text, " ");
+    let without_markdown = without_tags
+        .replace(['`', '*', '_'], "")
+        .replace("\\[", "[")
+        .replace("\\]", "]");
+    Regex::new(r"\s+")
+        .expect("valid regex")
+        .replace_all(&without_markdown, " ")
+        .trim()
+        .trim_matches(|char: char| matches!(char, '.' | ':' | ';' | '-' | '–' | '—'))
+        .to_lowercase()
+}
+
+fn strip_leading_section_number(text: &str) -> String {
+    Regex::new(r"^\s*\d+(?:\.\d+)*\.?\s+")
+        .expect("valid regex")
+        .replace(text, "")
+        .to_string()
+}
+
+fn escape_markdown_link_text(text: &str) -> String {
+    text.replace('\\', "\\\\")
+        .replace('[', "\\[")
+        .replace(']', "\\]")
+}
+
+fn is_standalone_anchor_line(line: &str) -> bool {
+    !standalone_anchor_ids(line).is_empty()
+}
+
+fn standalone_anchor_ids(line: &str) -> Vec<String> {
+    let wrapper = Regex::new(r#"^(?:<a\s+id="[^"]+"></a>\s*)+$"#).expect("valid regex");
+    if !wrapper.is_match(line) {
+        return Vec::new();
+    }
+    Regex::new(r#"<a\s+id="([^"]+)"></a>"#)
+        .expect("valid regex")
+        .captures_iter(line)
+        .filter_map(|captures| captures.get(1).map(|value| value.as_str().to_string()))
+        .collect()
+}
+
+fn markdown_heading_title(line: &str) -> Option<String> {
+    let captures = Regex::new(r"^#{1,6}\s+(.+?)\s*$")
+        .expect("valid regex")
+        .captures(line)?;
+    Some(captures.get(1)?.as_str().trim().to_string())
+}
+
+fn is_markdown_heading_line(line: &str) -> bool {
+    Regex::new(r"^#{1,6}\s+")
+        .expect("valid regex")
+        .is_match(line)
+}
+
+fn is_markdown_subheading_line(line: &str) -> bool {
+    Regex::new(r"^#{2,6}\s+")
+        .expect("valid regex")
+        .is_match(line)
 }
 
 fn anchor_position(markdown: &str, fragment: &str) -> Option<usize> {
@@ -2547,6 +2972,129 @@ mod tests {
         assert!(!markdown.contains("[<a id=\"kobo.3.1\"></a> Introduction"));
         assert!(markdown
             .contains("<a id=\"kobo.3.1\"></a> [Introduction to Fennel and Lua](chapter-1.md)"));
+    }
+
+    #[test]
+    fn links_plain_frontmatter_toc_entries_from_navigation() {
+        let nav_points = vec![
+            NavPoint {
+                title: "From the Author".to_string(),
+                epub_path: "EPUB/text/all.xhtml".to_string(),
+                fragment: Some("from-the-author".to_string()),
+                depth: 1,
+            },
+            NavPoint {
+                title: "1. How Multiparadigm Is Expanding Modern Languages".to_string(),
+                epub_path: "EPUB/text/all.xhtml".to_string(),
+                fragment: Some("1-how-multiparadigm-is-expanding-modern-languages".to_string()),
+                depth: 1,
+            },
+            NavPoint {
+                title: "1.1 The Iterator Pattern in OOP and First-Class Functions".to_string(),
+                epub_path: "EPUB/text/all.xhtml".to_string(),
+                fragment: Some(
+                    "11-the-iterator-pattern-in-oop-and-first-class-functions".to_string(),
+                ),
+                depth: 2,
+            },
+            NavPoint {
+                title: "1.6 Summary".to_string(),
+                epub_path: "EPUB/text/all.xhtml".to_string(),
+                fragment: Some("16-summary".to_string()),
+                depth: 2,
+            },
+            NavPoint {
+                title: "3.5 Summary".to_string(),
+                epub_path: "EPUB/text/all.xhtml".to_string(),
+                fragment: Some("35-summary".to_string()),
+                depth: 2,
+            },
+        ];
+        let chapter_links = ChapterLinkMap {
+            epub_path_to_markdown: HashMap::from([
+                (
+                    "EPUB/text/all.xhtml#from-the-author".to_string(),
+                    "001-Multi-Paradigm-Programming.md#from-the-author".to_string(),
+                ),
+                (
+                    "EPUB/text/all.xhtml#1-how-multiparadigm-is-expanding-modern-languages"
+                        .to_string(),
+                    "001-Multi-Paradigm-Programming.md#1-how-multiparadigm-is-expanding-modern-languages"
+                        .to_string(),
+                ),
+                (
+                    "EPUB/text/all.xhtml#11-the-iterator-pattern-in-oop-and-first-class-functions"
+                        .to_string(),
+                    "001-Multi-Paradigm-Programming.md#11-the-iterator-pattern-in-oop-and-first-class-functions"
+                        .to_string(),
+                ),
+                (
+                    "EPUB/text/all.xhtml#16-summary".to_string(),
+                    "001-Multi-Paradigm-Programming.md#16-summary".to_string(),
+                ),
+                (
+                    "EPUB/text/all.xhtml#35-summary".to_string(),
+                    "001-Multi-Paradigm-Programming.md#35-summary".to_string(),
+                ),
+            ]),
+        };
+        let markdown = "# Multi-Paradigm Programming\n\nCombining Functional, Object-Oriented, and Lisp Paradigms for Software Design and Implementation\n\n<a id=\"section-1\"></a>\n- From the Author\n\n<a id=\"section-2\"></a>\n1. How Multiparadigm Is Expanding Modern Languages\n   1. The Iterator Pattern in OOP and First-Class Functions\n   1. GoF’s Iterator Pattern\n   1. Summary\n\n<a id=\"from-the-author\"></a>\n## From the Author\n\n1. The Iterator Pattern in OOP and First-Class Functions\n\n<a id=\"gofs-iterator-pattern\"></a>\n### GoF’s Iterator Pattern\n";
+        let output_chapters = vec![(
+            "001-Multi-Paradigm-Programming.md".to_string(),
+            "Multi-Paradigm Programming".to_string(),
+            markdown.to_string(),
+        )];
+        let targets = plain_toc_link_targets(&nav_points, &chapter_links, &output_chapters);
+
+        let linked = link_plain_frontmatter_toc_entries(markdown, &targets);
+
+        assert!(linked
+            .contains("- [From the Author](001-Multi-Paradigm-Programming.md#from-the-author)"));
+        assert!(linked.contains("1. [How Multiparadigm Is Expanding Modern Languages](001-Multi-Paradigm-Programming.md#1-how-multiparadigm-is-expanding-modern-languages)"));
+        assert!(linked.contains("   1. [The Iterator Pattern in OOP and First-Class Functions](001-Multi-Paradigm-Programming.md#11-the-iterator-pattern-in-oop-and-first-class-functions)"));
+        assert!(linked.contains(
+            "   1. [GoF’s Iterator Pattern](001-Multi-Paradigm-Programming.md#gofs-iterator-pattern)"
+        ));
+        assert!(linked.contains("   1. [Summary](001-Multi-Paradigm-Programming.md#1-how-multiparadigm-is-expanding-modern-languages)"));
+        assert!(linked.contains(
+            "## From the Author\n\n1. The Iterator Pattern in OOP and First-Class Functions"
+        ));
+    }
+
+    #[test]
+    fn aggressively_splits_large_nav_packed_single_spine_books() {
+        let chapters = vec![ChapterData {
+            item: ManifestItem {
+                href: "all.xhtml".to_string(),
+                media_type: "application/xhtml+xml".to_string(),
+                absolute_path: "EPUB/text/all.xhtml".to_string(),
+                properties: String::new(),
+            },
+            data: vec![b'x'; 200_000],
+            file_name: "001-All.md".to_string(),
+            title: Some("All".to_string()),
+        }];
+        let mut nav_points = vec![NavPoint {
+            title: "Book Root".to_string(),
+            epub_path: "EPUB/text/all.xhtml".to_string(),
+            fragment: Some("root".to_string()),
+            depth: 1,
+        }];
+        for index in 1..=14 {
+            nav_points.push(NavPoint {
+                title: format!("{index}. Section {index}"),
+                epub_path: "EPUB/text/all.xhtml".to_string(),
+                fragment: Some(format!("section-{index}")),
+                depth: 2,
+            });
+        }
+
+        let segments = logical_chapter_segments(&chapters, &nav_points);
+
+        assert!(segments.len() > 4);
+        assert!(segments
+            .iter()
+            .any(|segment| segment.title == "1. Section 1"));
     }
 
     #[test]

@@ -5,6 +5,7 @@ import { marked } from 'marked';
 import { extractChapterSections, type ChapterSection } from './chapterSections';
 import { scopeReaderCss, styleTagContent } from './cssScope';
 import { structureFlatTocMarkdown } from './tocStructure';
+import { findTextMatches, normalizeQuery, type TextSearchMatch } from './textSearch';
 import { interpretHorizontalSwipe, interpretHorizontalWheel, targetChapterPath, type ChapterOffset, type GesturePoint } from './readerNavigation';
 import './styles.css';
 
@@ -64,6 +65,7 @@ type ReadingProgress = {
 };
 
 type ColorMode = 'daylight' | 'dark';
+type ReaderMode = 'scroll' | 'paged';
 
 type ReaderState = {
   appPaths?: AppPaths;
@@ -86,13 +88,21 @@ type ReaderState = {
   pendingFragment?: string;
   expandedChapterPaths: Set<string>;
   chapterListScrollTop: number;
+  readerPaneScrollTop: number;
   renderToken: number;
   colorMode: ColorMode;
+  readerMode: ReaderMode;
   sidebarWidth: number;
   readerWidthCh: number;
   readerFontSizePx: number;
   settingsOpen: boolean;
   librarySearch: string;
+  readerSearchQuery: string;
+  searchActiveIndex: number;
+  pendingSearchScroll: boolean;
+  pageIndex: number;
+  pageCount: number;
+  pendingPageTarget?: 'start' | 'end';
   homeDeleteMode: boolean;
   libraryContextMenu?: {
     path: string;
@@ -103,6 +113,7 @@ type ReaderState = {
 };
 
 const colorModeStorageKey = 'goosereader:color-mode';
+const readerModeStorageKey = 'goosereader:reader-mode';
 const sidebarWidthStorageKey = 'goosereader:sidebar-width';
 const readerWidthStorageKey = 'goosereader:reader-width-ch';
 const readerFontSizeStorageKey = 'goosereader:reader-font-size-px';
@@ -125,13 +136,20 @@ const state: ReaderState = {
   themeLoading: true,
   expandedChapterPaths: new Set(),
   chapterListScrollTop: 0,
+  readerPaneScrollTop: 0,
   renderToken: 0,
   colorMode: readStoredColorMode(),
+  readerMode: readStoredReaderMode(),
   sidebarWidth: readStoredSidebarWidth(),
   readerWidthCh: readStoredNumber(readerWidthStorageKey, defaultReaderWidthCh, minReaderWidthCh, maxReaderWidthCh),
   readerFontSizePx: readStoredNumber(readerFontSizeStorageKey, defaultReaderFontSizePx, minReaderFontSizePx, maxReaderFontSizePx),
   settingsOpen: false,
   librarySearch: '',
+  readerSearchQuery: '',
+  searchActiveIndex: -1,
+  pendingSearchScroll: false,
+  pageIndex: 0,
+  pageCount: 1,
   homeDeleteMode: false,
 };
 const appElement = document.querySelector<HTMLDivElement>('#app');
@@ -148,6 +166,10 @@ let homeLongPressTimer: number | undefined;
 let suppressHomeBookOpenUntil = 0;
 let lastHomeBookPointerType = 'mouse';
 let lastHomeBookPointerAt = 0;
+let searchCacheBook: BookPayload | undefined;
+let searchCacheQuery = '';
+let searchCacheMatches: TextSearchMatch[] = [];
+let pagedLayoutTimer: number | undefined;
 const appLogoUrl = new URL('./assets/goosereader-logo.png', import.meta.url).href;
 
 applyColorMode(state.colorMode);
@@ -157,8 +179,9 @@ marked.use({
   breaks: false,
 });
 
-function renderShell(options: { preserveChapterScroll?: boolean } = {}): void {
+function renderShell(options: { preserveChapterScroll?: boolean; preserveReaderScroll?: boolean } = {}): void {
   if (options.preserveChapterScroll !== false) captureChapterListScroll();
+  if (options.preserveReaderScroll !== false) captureReaderPaneScroll();
   const book = state.book;
   const current = currentChapter();
   app.innerHTML = `
@@ -232,6 +255,18 @@ function renderShell(options: { preserveChapterScroll?: boolean } = {}): void {
       nextInput?.setSelectionRange(cursor, cursor);
     });
   });
+  document.querySelector<HTMLInputElement>('#reader-search')?.addEventListener('input', event => {
+    const input = event.currentTarget as HTMLInputElement;
+    updateReaderSearch(input.value, input.selectionStart ?? input.value.length);
+  });
+  document.querySelector<HTMLInputElement>('#reader-search')?.addEventListener('keydown', event => {
+    if (event.key !== 'Enter') return;
+    event.preventDefault();
+    moveSearchResult(event.shiftKey ? -1 : 1);
+  });
+  document.querySelector<HTMLButtonElement>('#search-previous')?.addEventListener('click', () => moveSearchResult(-1));
+  document.querySelector<HTMLButtonElement>('#search-next')?.addEventListener('click', () => moveSearchResult(1));
+  document.querySelector<HTMLButtonElement>('#search-clear')?.addEventListener('click', clearReaderSearch);
   document.querySelector<HTMLButtonElement>('#home-button')?.addEventListener('click', showHome);
   document.querySelector<HTMLButtonElement>('#all-books-button')?.addEventListener('click', showHome);
   document.querySelector<HTMLButtonElement>('#done-delete-mode')?.addEventListener('click', () => {
@@ -309,6 +344,8 @@ function renderShell(options: { preserveChapterScroll?: boolean } = {}): void {
   });
   document.querySelector<HTMLButtonElement>('#previous-chapter')?.addEventListener('click', () => moveChapter(-1));
   document.querySelector<HTMLButtonElement>('#next-chapter')?.addEventListener('click', () => moveChapter(1));
+  document.querySelector<HTMLButtonElement>('#previous-page')?.addEventListener('click', () => moveReaderPage(-1));
+  document.querySelector<HTMLButtonElement>('#next-page')?.addEventListener('click', () => moveReaderPage(1));
   bindSidebarResize();
   bindReaderSettings();
   bindHomeBookLongPress();
@@ -316,6 +353,7 @@ function renderShell(options: { preserveChapterScroll?: boolean } = {}): void {
   bindReaderGestures();
   bindReaderLinks();
   restoreChapterListScroll();
+  if (options.preserveReaderScroll !== false) restoreReaderPaneScroll();
   void renderSelectedChapter(book, current);
 }
 
@@ -340,6 +378,14 @@ function readStoredColorMode(): ColorMode {
     return window.localStorage.getItem(colorModeStorageKey) === 'dark' ? 'dark' : 'daylight';
   } catch {
     return 'daylight';
+  }
+}
+
+function readStoredReaderMode(): ReaderMode {
+  try {
+    return window.localStorage.getItem(readerModeStorageKey) === 'paged' ? 'paged' : 'scroll';
+  } catch {
+    return 'scroll';
   }
 }
 
@@ -424,6 +470,15 @@ function settingsMenuContent(): string {
 
       <section class="sidebar-section reader-settings-panel" aria-label="Reader settings">
         <div class="section-heading"><span>Reader</span></div>
+        <label class="reader-setting" for="reader-mode">
+          <span class="reader-setting-label">
+            <span>Reading mode</span>
+          </span>
+          <select id="reader-mode" class="theme-select">
+            <option value="scroll" ${state.readerMode === 'scroll' ? 'selected' : ''}>Scroll</option>
+            <option value="paged" ${state.readerMode === 'paged' ? 'selected' : ''}>Pages</option>
+          </select>
+        </label>
         <label class="reader-setting" for="reader-width">
           <span class="reader-setting-label">
             <span>Page width</span>
@@ -459,10 +514,29 @@ function libraryContextMenuContent(): string {
 
 function readerToolbarContent(book: BookPayload | undefined, chapter: BookChapter | undefined): string {
   const visibleBooks = filteredLibrary();
+  const matches = currentSearchMatches();
+  const hasQuery = normalizeQuery(state.readerSearchQuery).length > 0;
+  const activeSearchPosition = matches.length > 0 && state.searchActiveIndex >= 0
+    ? `${state.searchActiveIndex + 1} of ${matches.length}`
+    : hasQuery ? 'No results' : '';
   return `
     <header class="reader-toolbar" aria-label="Reader toolbar">
-      <span class="reader-toolbar-title">${escapeHtml(book?.title ?? 'Home')}</span>
-      <span class="reader-toolbar-subtitle">${escapeHtml(chapter?.title ?? `${visibleBooks.length} book${visibleBooks.length === 1 ? '' : 's'}`)}</span>
+      <div class="reader-toolbar-copy">
+        <span class="reader-toolbar-title">${escapeHtml(book?.title ?? 'Home')}</span>
+        <span class="reader-toolbar-subtitle">${escapeHtml(chapter?.title ?? `${visibleBooks.length} book${visibleBooks.length === 1 ? '' : 's'}`)}</span>
+      </div>
+      ${book ? `
+        <div class="reader-search-controls" role="search" aria-label="Search book text">
+          <label class="reader-search-box" for="reader-search">
+            <span class="search-icon" aria-hidden="true">⌕</span>
+            <input id="reader-search" type="search" placeholder="Search text" value="${escapeHtml(state.readerSearchQuery)}" autocomplete="off" />
+          </label>
+          <span class="reader-search-count" aria-live="polite">${escapeHtml(activeSearchPosition)}</span>
+          <button id="search-previous" class="reader-search-button" type="button" ${matches.length === 0 ? 'disabled' : ''} aria-label="Previous search result">↑</button>
+          <button id="search-next" class="reader-search-button" type="button" ${matches.length === 0 ? 'disabled' : ''} aria-label="Next search result">↓</button>
+          <button id="search-clear" class="reader-search-button" type="button" ${!hasQuery ? 'disabled' : ''} aria-label="Clear search">×</button>
+        </div>
+      ` : ''}
     </header>
   `;
 }
@@ -477,17 +551,73 @@ function filteredLibrary(): LibraryBook[] {
   });
 }
 
+function currentSearchMatches(): TextSearchMatch[] {
+  if (!state.book) return [];
+  const query = normalizeQuery(state.readerSearchQuery);
+  if (searchCacheBook === state.book && searchCacheQuery === query) return searchCacheMatches;
+  searchCacheBook = state.book;
+  searchCacheQuery = query;
+  searchCacheMatches = findTextMatches(state.book.chapters, query);
+  return searchCacheMatches;
+}
+
+function updateReaderSearch(query: string, cursor: number): void {
+  const previousQuery = normalizeQuery(state.readerSearchQuery);
+  state.readerSearchQuery = query;
+  const nextQuery = normalizeQuery(query);
+  const matches = currentSearchMatches();
+  const preferredIndex = previousQuery === nextQuery && state.searchActiveIndex >= 0 ? state.searchActiveIndex : 0;
+  state.searchActiveIndex = matches.length > 0 ? clampNumber(preferredIndex, 0, matches.length - 1) : -1;
+  state.pendingSearchScroll = matches.length > 0;
+  if (matches.length > 0 && state.selectedPath !== matches[state.searchActiveIndex].chapterPath) {
+    state.selectedPath = matches[state.searchActiveIndex].chapterPath;
+    state.expandedChapterPaths.add(matches[state.searchActiveIndex].chapterPath);
+    void saveCurrentReadingProgress();
+  }
+  renderShell();
+  requestAnimationFrame(() => {
+    const input = document.querySelector<HTMLInputElement>('#reader-search');
+    input?.focus();
+    input?.setSelectionRange(cursor, cursor);
+  });
+}
+
+function clearReaderSearch(): void {
+  state.readerSearchQuery = '';
+  state.searchActiveIndex = -1;
+  state.pendingSearchScroll = false;
+  renderShell();
+  requestAnimationFrame(() => document.querySelector<HTMLInputElement>('#reader-search')?.focus());
+}
+
+function moveSearchResult(offset: 1 | -1): void {
+  const matches = currentSearchMatches();
+  if (matches.length === 0) return;
+  const current = state.searchActiveIndex >= 0 ? state.searchActiveIndex : (offset > 0 ? -1 : 0);
+  state.searchActiveIndex = (current + offset + matches.length) % matches.length;
+  const match = matches[state.searchActiveIndex];
+  state.selectedPath = match.chapterPath;
+  state.pendingSearchScroll = true;
+  state.expandedChapterPaths.add(match.chapterPath);
+  renderShell();
+  void saveCurrentReadingProgress();
+}
+
 function showHome(): void {
   renderedChapterCache.clear();
   state.book = undefined;
   state.selectedBookPath = undefined;
   state.selectedPath = undefined;
   state.pendingFragment = undefined;
+  state.readerSearchQuery = '';
+  state.searchActiveIndex = -1;
+  state.pendingSearchScroll = false;
   state.expandedChapterPaths = new Set();
   state.chapterListScrollTop = 0;
+  state.readerPaneScrollTop = 0;
   state.error = undefined;
   state.libraryContextMenu = undefined;
-  renderShell({ preserveChapterScroll: false });
+  renderShell({ preserveChapterScroll: false, preserveReaderScroll: false });
 }
 
 function homeContent(): string {
@@ -644,20 +774,33 @@ function readerContent(book: BookPayload | undefined, chapter: BookChapter | und
   }
   const index = book.chapters.findIndex(item => item.path === chapter.path);
   const cached = renderedChapterCache.get(chapterCacheKey(book, chapter));
+  const isPaged = state.readerMode === 'paged';
   return `
-    <article class="reader-card" style="${readerPreferenceStyle()}" aria-label="Reader chapter. Swipe left or right to change chapters.">
+    <article class="reader-card ${isPaged ? 'paged' : 'scroll'}" style="${readerPreferenceStyle()}" aria-label="Reader chapter. ${isPaged ? 'Use page controls to change pages.' : 'Swipe left or right to change chapters.'}">
       <style>${styleTagContent(scopeReaderCss(book.style_css) + "\n" + scopeReaderCss(state.themeCss ?? '') + "\n" + readerPreferenceCss() + "\n" + readerColorModeCss())}</style>
-      <div class="book-content" data-render-chapter="${escapeHtml(chapter.path)}">${cached ?? loadingChapterMarkup(chapter)}</div>
+      <div class="book-content ${isPaged ? 'paged-content' : ''}" data-render-chapter="${escapeHtml(chapter.path)}">${cached ?? loadingChapterMarkup(chapter)}</div>
       <div class="reader-nav" aria-label="Reader chapter navigation">
-        <button id="previous-chapter" type="button" ${index <= 0 ? 'disabled' : ''}>Previous</button>
+        <button id="${isPaged ? 'previous-page' : 'previous-chapter'}" type="button" ${isPaged ? previousPageDisabled(index) : index <= 0 ? 'disabled' : ''}>Previous</button>
         <span class="reader-position" aria-live="polite">
-          <span>Chapter ${index + 1} of ${book.chapters.length}</span>
-          <span class="swipe-hint">Swipe left or right to change chapters</span>
+          <span id="page-position">${isPaged ? pagePositionText(index, book.chapters.length) : `Chapter ${index + 1} of ${book.chapters.length}`}</span>
+          <span class="swipe-hint">${isPaged ? 'Use arrows or swipe to turn pages' : 'Swipe left or right to change chapters'}</span>
         </span>
-        <button id="next-chapter" type="button" ${index >= book.chapters.length - 1 ? 'disabled' : ''}>Next</button>
+        <button id="${isPaged ? 'next-page' : 'next-chapter'}" type="button" ${isPaged ? nextPageDisabled(index, book.chapters.length) : index >= book.chapters.length - 1 ? 'disabled' : ''}>Next</button>
       </div>
     </article>
   `;
+}
+
+function pagePositionText(chapterIndex: number, chapterCount: number): string {
+  return `Page ${state.pageIndex + 1} of ${Math.max(1, state.pageCount)} • Chapter ${chapterIndex + 1} of ${chapterCount}`;
+}
+
+function previousPageDisabled(chapterIndex: number): string {
+  return chapterIndex <= 0 && state.pageIndex <= 0 ? 'disabled' : '';
+}
+
+function nextPageDisabled(chapterIndex: number, chapterCount: number): string {
+  return chapterIndex >= chapterCount - 1 && state.pageIndex >= Math.max(0, state.pageCount - 1) ? 'disabled' : '';
 }
 
 function readerPreferenceStyle(): string {
@@ -785,7 +928,7 @@ async function importEpub(): Promise<void> {
     state.error = error instanceof Error ? error.message : String(error);
   } finally {
     state.importing = false;
-    renderShell({ preserveChapterScroll: false });
+    renderShell({ preserveChapterScroll: false, preserveReaderScroll: false });
   }
 }
 
@@ -803,7 +946,7 @@ async function openLibraryBook(path: string): Promise<void> {
     state.error = error instanceof Error ? error.message : String(error);
   } finally {
     state.loading = false;
-    renderShell({ preserveChapterScroll: false });
+    renderShell({ preserveChapterScroll: false, preserveReaderScroll: false });
   }
 }
 
@@ -826,6 +969,7 @@ async function deleteLibraryBook(path: string, title: string): Promise<void> {
       state.pendingFragment = undefined;
       state.expandedChapterPaths = new Set();
       state.chapterListScrollTop = 0;
+      state.readerPaneScrollTop = 0;
     }
     await refreshLibrary(false);
   } catch (error) {
@@ -858,8 +1002,18 @@ async function saveCurrentReadingProgress(): Promise<void> {
 
 function openBookPayload(book: BookPayload, path: string, progressChapterPath?: string): void {
   renderedChapterCache.clear();
+  searchCacheBook = undefined;
+  searchCacheQuery = '';
+  searchCacheMatches = [];
   state.book = book;
   state.selectedBookPath = path;
+  state.readerSearchQuery = '';
+  state.searchActiveIndex = -1;
+  state.pendingSearchScroll = false;
+  state.readerPaneScrollTop = 0;
+  state.pageIndex = 0;
+  state.pageCount = 1;
+  state.pendingPageTarget = 'start';
   const progressChapter = book.chapters.find(chapter => chapter.path === progressChapterPath);
   const selectedPath = progressChapter?.path ?? book.chapters[0]?.path;
   state.selectedPath = selectedPath;
@@ -908,6 +1062,8 @@ async function renderSelectedChapter(book: BookPayload | undefined, chapter: Boo
     target.innerHTML = cached;
     applySectionIds(target, chapter);
     bindReaderLinks(target);
+    applySearchHighlights(target, chapter);
+    updatePagedLayout();
     scrollPendingFragment();
     return;
   }
@@ -934,6 +1090,8 @@ async function renderSelectedChapter(book: BookPayload | undefined, chapter: Boo
   const html = target.innerHTML;
   renderedChapterCache.set(key, html);
   bindReaderLinks(target);
+  applySearchHighlights(target, chapter);
+  updatePagedLayout();
   scrollPendingFragment();
 }
 
@@ -966,16 +1124,48 @@ function currentChapter(): BookChapter | undefined {
 function moveChapter(offset: ChapterOffset): void {
   const nextPath = targetChapterPath(state.book?.chapters ?? [], state.selectedPath, offset);
   if (!nextPath) return;
-  selectChapter(nextPath);
+  selectChapter(nextPath, { pageTarget: 'start' });
   scrollReaderPaneToTop();
 }
 
-function selectChapter(chapterPath: string, options: { fragment?: string } = {}): void {
+function moveReaderPage(offset: ChapterOffset): void {
+  if (state.readerMode !== 'paged') {
+    moveChapter(offset);
+    return;
+  }
+  if (offset > 0) {
+    if (state.pageIndex < state.pageCount - 1) {
+      setReaderPage(state.pageIndex + 1);
+      return;
+    }
+    const nextPath = targetChapterPath(state.book?.chapters ?? [], state.selectedPath, 1);
+    if (nextPath) selectChapter(nextPath, { pageTarget: 'start' });
+    return;
+  }
+  if (state.pageIndex > 0) {
+    setReaderPage(state.pageIndex - 1);
+    return;
+  }
+  const previousPath = targetChapterPath(state.book?.chapters ?? [], state.selectedPath, -1);
+  if (previousPath) selectChapter(previousPath, { pageTarget: 'end' });
+}
+
+function setReaderPage(pageIndex: number): void {
+  state.pageIndex = clampNumber(pageIndex, 0, Math.max(0, state.pageCount - 1));
+  applyPagedScroll('smooth');
+  updatePageControls();
+}
+
+function selectChapter(chapterPath: string, options: { fragment?: string; pageTarget?: 'start' | 'end' } = {}): void {
   state.selectedPath = chapterPath;
   state.error = undefined;
   state.pendingFragment = options.fragment;
+  state.pendingPageTarget = options.pageTarget ?? 'start';
+  state.pageIndex = 0;
+  state.pageCount = 1;
+  if (!options.fragment) state.readerPaneScrollTop = 0;
   state.expandedChapterPaths.add(chapterPath);
-  renderShell();
+  renderShell({ preserveReaderScroll: false });
   void saveCurrentReadingProgress();
 }
 
@@ -984,10 +1174,21 @@ function captureChapterListScroll(): void {
   if (chapterList) state.chapterListScrollTop = chapterList.scrollTop;
 }
 
+function captureReaderPaneScroll(): void {
+  const readerPane = document.querySelector<HTMLElement>('.reader-pane');
+  if (readerPane) state.readerPaneScrollTop = readerPane.scrollTop;
+}
+
 function restoreChapterListScroll(): void {
   const chapterList = document.querySelector<HTMLElement>('.chapter-list');
   if (!chapterList) return;
   chapterList.scrollTop = state.chapterListScrollTop;
+}
+
+function restoreReaderPaneScroll(): void {
+  const readerPane = document.querySelector<HTMLElement>('.reader-pane');
+  if (!readerPane) return;
+  readerPane.scrollTop = state.readerPaneScrollTop;
 }
 
 function bindSidebarResize(): void {
@@ -1103,16 +1304,31 @@ function bindLibraryContextMenuDismiss(): void {
 }
 
 function bindReaderSettings(): void {
+  const modeInput = document.querySelector<HTMLSelectElement>('#reader-mode');
   const widthInput = document.querySelector<HTMLInputElement>('#reader-width');
   const widthValue = document.querySelector<HTMLOutputElement>('#reader-width-value');
   const fontSizeInput = document.querySelector<HTMLInputElement>('#reader-font-size');
   const fontSizeValue = document.querySelector<HTMLOutputElement>('#reader-font-size-value');
+
+  modeInput?.addEventListener('change', () => {
+    state.readerMode = modeInput.value === 'paged' ? 'paged' : 'scroll';
+    state.pageIndex = 0;
+    state.pageCount = 1;
+    state.pendingPageTarget = 'start';
+    try {
+      window.localStorage.setItem(readerModeStorageKey, state.readerMode);
+    } catch {
+      // Ignore storage failures; mode can still update in memory.
+    }
+    renderShell({ preserveReaderScroll: false });
+  });
 
   widthInput?.addEventListener('input', () => {
     state.readerWidthCh = clampNumber(Number(widthInput.value), minReaderWidthCh, maxReaderWidthCh);
     widthInput.value = String(state.readerWidthCh);
     if (widthValue) widthValue.value = `${state.readerWidthCh}ch`;
     applyReaderSettings();
+    schedulePagedLayout();
   });
   widthInput?.addEventListener('change', persistReaderSettings);
 
@@ -1121,12 +1337,66 @@ function bindReaderSettings(): void {
     fontSizeInput.value = String(state.readerFontSizePx);
     if (fontSizeValue) fontSizeValue.value = `${state.readerFontSizePx}px`;
     applyReaderSettings();
+    schedulePagedLayout();
   });
   fontSizeInput?.addEventListener('change', persistReaderSettings);
 }
 
 function applyReaderSettings(): void {
   document.querySelector<HTMLElement>('.reader-card')?.setAttribute('style', readerPreferenceStyle());
+}
+
+function schedulePagedLayout(): void {
+  if (pagedLayoutTimer) window.clearTimeout(pagedLayoutTimer);
+  pagedLayoutTimer = window.setTimeout(() => {
+    pagedLayoutTimer = undefined;
+    updatePagedLayout();
+  }, 80);
+}
+
+function updatePagedLayout(): void {
+  if (state.readerMode !== 'paged') return;
+  requestAnimationFrame(() => {
+    const content = currentRenderedBookContent();
+    if (!content) return;
+    const pageWidth = Math.max(1, content.clientWidth);
+    const pageCount = Math.max(1, Math.ceil(content.scrollWidth / pageWidth));
+    state.pageCount = pageCount;
+    if (state.pendingPageTarget === 'end') {
+      state.pageIndex = pageCount - 1;
+    } else {
+      state.pageIndex = clampNumber(state.pageIndex, 0, pageCount - 1);
+    }
+    state.pendingPageTarget = undefined;
+    applyPagedScroll('auto');
+    updatePageControls();
+  });
+}
+
+function currentRenderedBookContent(): HTMLElement | undefined {
+  const chapter = currentChapter();
+  if (!chapter) return undefined;
+  return document.querySelector<HTMLElement>(`.book-content[data-render-chapter="${cssString(chapter.path)}"]`) ?? undefined;
+}
+
+function applyPagedScroll(behavior: ScrollBehavior): void {
+  const content = currentRenderedBookContent();
+  if (!content || state.readerMode !== 'paged') return;
+  content.scrollTo({ left: state.pageIndex * content.clientWidth, behavior });
+}
+
+function updatePageControls(): void {
+  if (state.readerMode !== 'paged') return;
+  const book = state.book;
+  const chapter = currentChapter();
+  if (!book || !chapter) return;
+  const chapterIndex = book.chapters.findIndex(item => item.path === chapter.path);
+  const position = document.querySelector<HTMLElement>('#page-position');
+  if (position) position.textContent = pagePositionText(chapterIndex, book.chapters.length);
+  const previous = document.querySelector<HTMLButtonElement>('#previous-page');
+  const next = document.querySelector<HTMLButtonElement>('#next-page');
+  if (previous) previous.disabled = chapterIndex <= 0 && state.pageIndex <= 0;
+  if (next) next.disabled = chapterIndex >= book.chapters.length - 1 && state.pageIndex >= state.pageCount - 1;
 }
 
 function bindReaderGestures(): void {
@@ -1147,7 +1417,8 @@ function bindReaderGestures(): void {
     if (!decision) return;
     event.preventDefault();
     suppressNextReaderClickUntil = Date.now() + 350;
-    moveChapter(decision);
+    if (state.readerMode === 'paged') moveReaderPage(decision);
+    else moveChapter(decision);
   });
   card.addEventListener('click', event => {
     if (Date.now() <= suppressNextReaderClickUntil) {
@@ -1174,7 +1445,8 @@ function bindReaderGestures(): void {
       window.clearTimeout(wheelResetTimer);
       wheelResetTimer = undefined;
     }
-    moveChapter(decision);
+    if (state.readerMode === 'paged') moveReaderPage(decision);
+    else moveChapter(decision);
   }, { passive: false });
 }
 
@@ -1232,6 +1504,70 @@ function applySectionIds(scope: ParentNode, chapter: BookChapter): void {
     const section = sections[index];
     if (section && !heading.id) heading.id = section.id;
   });
+}
+
+function applySearchHighlights(scope: HTMLElement, chapter: BookChapter): void {
+  const query = normalizeQuery(state.readerSearchQuery);
+  if (!query) return;
+
+  const matches = currentSearchMatches();
+  const active = matches[state.searchActiveIndex];
+  const activeOccurrence = active?.chapterPath === chapter.path ? active.matchIndexInChapter : -1;
+  let occurrence = 0;
+  let activeMark: HTMLElement | undefined;
+  const walker = document.createTreeWalker(scope, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      const text = node.textContent ?? '';
+      if (!text.trim()) return NodeFilter.FILTER_REJECT;
+      const parent = node.parentElement;
+      if (!parent || parent.closest('script, style, mark.reader-search-hit')) return NodeFilter.FILTER_REJECT;
+      return text.toLocaleLowerCase().includes(query) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT;
+    },
+  });
+  const nodes: Text[] = [];
+  while (walker.nextNode()) nodes.push(walker.currentNode as Text);
+
+  for (const node of nodes) {
+    const text = node.textContent ?? '';
+    const lower = text.toLocaleLowerCase();
+    const fragment = document.createDocumentFragment();
+    let cursor = 0;
+    while (cursor < text.length) {
+      const found = lower.indexOf(query, cursor);
+      if (found === -1) break;
+      if (found > cursor) fragment.append(document.createTextNode(text.slice(cursor, found)));
+      const mark = document.createElement('mark');
+      mark.className = 'reader-search-hit';
+      if (occurrence === activeOccurrence) {
+        mark.classList.add('active');
+        activeMark = mark;
+      }
+      mark.textContent = text.slice(found, found + query.length);
+      fragment.append(mark);
+      occurrence += 1;
+      cursor = found + query.length;
+    }
+    if (cursor < text.length) fragment.append(document.createTextNode(text.slice(cursor)));
+    node.replaceWith(fragment);
+  }
+
+  if (state.pendingSearchScroll && activeMark) {
+    if (state.readerMode === 'paged') {
+      const content = currentRenderedBookContent();
+      if (content) {
+        state.pageIndex = clampNumber(
+          Math.floor(activeMark.offsetLeft / Math.max(1, content.clientWidth)),
+          0,
+          Math.max(0, state.pageCount - 1),
+        );
+        applyPagedScroll('smooth');
+        updatePageControls();
+      }
+    } else {
+      activeMark.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    }
+    state.pendingSearchScroll = false;
+  }
 }
 
 function splitMarkdownForProgressiveRender(markdown: string): string[] {
@@ -1320,6 +1656,26 @@ function escapeHtml(value: string): string {
 function cssString(value: string): string {
   return window.CSS?.escape ? window.CSS.escape(value) : value.replace(/["\\]/g, '\\$&');
 }
+
+document.addEventListener('keydown', event => {
+  if (!state.book || event.defaultPrevented) return;
+  if ((event.metaKey || event.ctrlKey) && event.key.toLocaleLowerCase() === 'f') {
+    event.preventDefault();
+    document.querySelector<HTMLInputElement>('#reader-search')?.focus();
+    return;
+  }
+  const target = event.target;
+  if (target instanceof HTMLElement && target.closest('input, textarea, select, button')) return;
+  if (state.readerMode === 'paged' && (event.key === 'ArrowRight' || event.key === 'PageDown' || event.key === ' ')) {
+    event.preventDefault();
+    moveReaderPage(1);
+  } else if (state.readerMode === 'paged' && (event.key === 'ArrowLeft' || event.key === 'PageUp')) {
+    event.preventDefault();
+    moveReaderPage(-1);
+  }
+});
+
+window.addEventListener('resize', schedulePagedLayout);
 
 renderShell();
 void bootstrap();
