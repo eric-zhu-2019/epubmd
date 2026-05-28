@@ -64,7 +64,8 @@ type ReadingProgress = {
   updated_ms: number;
 };
 
-type ColorMode = 'daylight' | 'dark';
+type ColorMode = 'system' | 'daylight' | 'dark';
+type ResolvedColorMode = 'daylight' | 'dark';
 type ReaderMode = 'scroll' | 'paged';
 
 type ReaderState = {
@@ -157,6 +158,7 @@ if (!appElement) throw new Error('missing #app');
 const app: HTMLDivElement = appElement;
 const renderedChapterCache = new Map<string, string>();
 const assetIndexCache = new WeakMap<BookPayload, Map<string, string>>();
+const systemColorScheme = window.matchMedia('(prefers-color-scheme: dark)');
 let swipeStart: GesturePoint | undefined;
 let suppressNextReaderClickUntil = 0;
 let accumulatedHorizontalWheelDelta = 0;
@@ -172,7 +174,7 @@ let searchCacheMatches: TextSearchMatch[] = [];
 let pagedLayoutTimer: number | undefined;
 const appLogoUrl = new URL('./assets/goosereader-logo.png', import.meta.url).href;
 
-applyColorMode(state.colorMode);
+applyColorMode(resolveColorMode(state.colorMode));
 
 marked.use({
   gfm: true,
@@ -184,6 +186,7 @@ function renderShell(options: { preserveChapterScroll?: boolean; preserveReaderS
   if (options.preserveReaderScroll !== false) captureReaderPaneScroll();
   const book = state.book;
   const current = currentChapter();
+  const resolvedColorMode = resolveColorMode(state.colorMode);
   app.innerHTML = `
     <main class="shell" style="--sidebar-width: ${state.sidebarWidth}px">
       <aside class="sidebar">
@@ -196,8 +199,8 @@ function renderShell(options: { preserveChapterScroll?: boolean; preserveReaderS
                 <button id="settings-toggle" class="header-icon-button settings-toggle" type="button" aria-expanded="${state.settingsOpen}" aria-controls="settings-menu" aria-label="${state.settingsOpen ? 'Hide' : 'Show'} settings" title="Settings">
                   <span class="toggle-icon" aria-hidden="true">⚙</span>
                 </button>
-                <button id="color-mode-toggle" class="header-icon-button color-mode-toggle" type="button" aria-pressed="${state.colorMode === 'dark'}" aria-label="Switch to ${state.colorMode === 'dark' ? 'daylight' : 'dark'} mode" title="${state.colorMode === 'dark' ? 'Dark mode' : 'Daylight mode'}">
-                  <span class="toggle-icon" aria-hidden="true">${state.colorMode === 'dark' ? '☾' : '☀'}</span>
+                <button id="color-mode-toggle" class="header-icon-button color-mode-toggle" type="button" aria-pressed="${resolvedColorMode === 'dark'}" aria-label="${colorModeToggleLabel()}" title="${colorModeToggleLabel()}">
+                  <span class="toggle-icon" aria-hidden="true">${colorModeIcon()}</span>
                 </button>
               </div>
               <span class="brand-subtitle">Markdown goose reader</span>
@@ -359,8 +362,8 @@ function renderShell(options: { preserveChapterScroll?: boolean; preserveReaderS
 
 
 function toggleColorMode(): void {
-  state.colorMode = state.colorMode === 'dark' ? 'daylight' : 'dark';
-  applyColorMode(state.colorMode);
+  state.colorMode = nextColorMode(state.colorMode);
+  applyColorMode(resolveColorMode(state.colorMode));
   try {
     window.localStorage.setItem(colorModeStorageKey, state.colorMode);
   } catch {
@@ -369,15 +372,40 @@ function toggleColorMode(): void {
   renderShell();
 }
 
-function applyColorMode(mode: ColorMode): void {
+function nextColorMode(mode: ColorMode): ColorMode {
+  if (mode === 'system') return 'daylight';
+  if (mode === 'daylight') return 'dark';
+  return 'system';
+}
+
+function colorModeIcon(): string {
+  if (state.colorMode === 'system') return '◐';
+  return state.colorMode === 'dark' ? '☾' : '☀';
+}
+
+function colorModeToggleLabel(): string {
+  if (state.colorMode === 'system') {
+    return `Appearance follows system (${resolveColorMode(state.colorMode)}). Switch to daylight mode`;
+  }
+  if (state.colorMode === 'daylight') return 'Daylight mode. Switch to dark mode';
+  return 'Dark mode. Switch to system appearance';
+}
+
+function resolveColorMode(mode: ColorMode): ResolvedColorMode {
+  if (mode !== 'system') return mode;
+  return systemColorScheme.matches ? 'dark' : 'daylight';
+}
+
+function applyColorMode(mode: ResolvedColorMode): void {
   document.documentElement.dataset.colorMode = mode;
 }
 
 function readStoredColorMode(): ColorMode {
   try {
-    return window.localStorage.getItem(colorModeStorageKey) === 'dark' ? 'dark' : 'daylight';
+    const stored = window.localStorage.getItem(colorModeStorageKey);
+    return stored === 'daylight' || stored === 'dark' ? stored : 'system';
   } catch {
-    return 'daylight';
+    return 'system';
   }
 }
 
@@ -825,7 +853,7 @@ function readerPreferenceCss(): string {
 }
 
 function readerColorModeCss(): string {
-  if (state.colorMode !== 'dark') return '';
+  if (resolveColorMode(state.colorMode) !== 'dark') return '';
   return `
     html[data-color-mode="dark"] .reader-card,
     html[data-color-mode="dark"] .reader-card .book-content {
@@ -1676,6 +1704,11 @@ document.addEventListener('keydown', event => {
 });
 
 window.addEventListener('resize', schedulePagedLayout);
+systemColorScheme.addEventListener('change', () => {
+  if (state.colorMode !== 'system') return;
+  applyColorMode(resolveColorMode(state.colorMode));
+  renderShell();
+});
 
 renderShell();
 void bootstrap();
