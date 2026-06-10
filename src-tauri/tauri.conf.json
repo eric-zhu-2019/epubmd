@@ -10,15 +10,6 @@
     "frontendDist": "../dist-web"
   },
   "app": {
-    "windows": [
-      {
-        "title": "goosereader",
-        "width": 1120,
-        "height": 820,
-        "minWidth": 760,
-        "minHeight": 560
-      }
-    ],
     "security": {
       "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: asset: http://asset.localhost; connect-src ipc: http://ipc.localhost"
     }

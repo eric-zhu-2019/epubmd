@@ -964,6 +964,22 @@ fn display_path(path: &Path) -> String {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .setup(|app| {
+            let window_builder =
+                tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::default())
+                    .title("goosereader")
+                    .inner_size(1120.0, 820.0)
+                    .min_inner_size(760.0, 560.0);
+
+            #[cfg(target_os = "macos")]
+            let window_builder =
+                window_builder
+                    .hidden_title(true)
+                    .title_bar_style(tauri::TitleBarStyle::Overlay);
+
+            window_builder.build()?;
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             app_paths,
             import_epub,

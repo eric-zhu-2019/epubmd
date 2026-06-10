@@ -76,6 +76,13 @@ type ReadingProgress = {
 type ColorMode = 'system' | 'daylight' | 'dark';
 type ResolvedColorMode = 'daylight' | 'dark';
 type ReaderMode = 'scroll' | 'paged';
+type ReaderFontFamily = 'literata' | 'new-york' | 'iowan' | 'charter' | 'georgia' | 'palatino' | 'baskerville' | 'system-sans' | 'mono';
+
+type ReaderFontOption = {
+  value: ReaderFontFamily;
+  label: string;
+  detail: string;
+};
 
 type ReaderState = {
   appPaths?: AppPaths;
@@ -107,6 +114,8 @@ type ReaderState = {
   outlineSidebarHidden: boolean;
   readerWidthCh: number;
   readerFontSizePx: number;
+  readerFontFamily: ReaderFontFamily;
+  readerFontMenuOpen: boolean;
   settingsOpen: boolean;
   librarySearch: string;
   readerSearchQuery: string;
@@ -131,6 +140,18 @@ const librarySidebarHiddenStorageKey = 'goosereader:library-sidebar-hidden';
 const outlineSidebarHiddenStorageKey = 'goosereader:outline-sidebar-hidden';
 const readerWidthStorageKey = 'goosereader:reader-width-ch';
 const readerFontSizeStorageKey = 'goosereader:reader-font-size-px';
+const readerFontFamilyStorageKey = 'goosereader:reader-font-family';
+const readerFontOptions: ReaderFontOption[] = [
+  { value: 'literata', label: 'Literata', detail: 'Book serif' },
+  { value: 'new-york', label: 'New York', detail: 'Apple serif' },
+  { value: 'iowan', label: 'Iowan', detail: 'Classic serif' },
+  { value: 'charter', label: 'Charter', detail: 'Screen serif' },
+  { value: 'georgia', label: 'Georgia', detail: 'Web serif' },
+  { value: 'palatino', label: 'Palatino', detail: 'Wide serif' },
+  { value: 'baskerville', label: 'Baskerville', detail: 'Literary serif' },
+  { value: 'system-sans', label: 'System Sans', detail: 'Interface sans' },
+  { value: 'mono', label: 'Mono', detail: 'Code style' },
+];
 const defaultSidebarWidth = 320;
 const minSidebarWidth = 260;
 const maxSidebarWidth = 560;
@@ -159,6 +180,8 @@ const state: ReaderState = {
   outlineSidebarHidden: readStoredBoolean(outlineSidebarHiddenStorageKey, false),
   readerWidthCh: readStoredNumber(readerWidthStorageKey, defaultReaderWidthCh, minReaderWidthCh, maxReaderWidthCh),
   readerFontSizePx: readStoredNumber(readerFontSizeStorageKey, defaultReaderFontSizePx, minReaderFontSizePx, maxReaderFontSizePx),
+  readerFontFamily: readStoredReaderFontFamily(),
+  readerFontMenuOpen: false,
   settingsOpen: false,
   librarySearch: '',
   readerSearchQuery: '',
@@ -191,6 +214,7 @@ let searchCacheMatches: TextSearchMatch[] = [];
 let pagedLayoutTimer: number | undefined;
 const appLogoUrl = new URL('./assets/goosereader-logo.png', import.meta.url).href;
 
+document.documentElement.classList.toggle('tauri-runtime', hasTauriRuntime());
 applyColorMode(resolveColorMode(state.colorMode));
 
 marked.use({
@@ -210,46 +234,32 @@ function renderShell(options: { preserveChapterScroll?: boolean; preserveReaderS
     state.outlineSidebarHidden ? 'outline-hidden' : '',
   ].filter(Boolean).join(' ');
   app.innerHTML = `
-    <main class="${shellClasses}" style="--library-column-width: ${state.librarySidebarHidden ? '0px' : 'var(--library-width)'}; --sidebar-width: ${state.outlineSidebarHidden ? 0 : state.sidebarWidth}px">
+    <div class="app-frame">
+      ${appTitlebarContent(book, resolvedColorMode)}
+      <main class="${shellClasses}" style="--library-column-width: ${state.librarySidebarHidden ? '0px' : 'var(--library-width)'}; --sidebar-width: ${state.outlineSidebarHidden ? 0 : state.sidebarWidth}px">
       ${state.librarySidebarHidden ? '' : `
       <aside class="library-sidebar">
-        <div class="brand">
-          <div class="brand-lockup">
-            <img class="brand-logo" src="${appLogoUrl}" alt="" aria-hidden="true" />
-            <div class="brand-copy">
-              <div class="brand-title-row">
-                <h1>goosereader</h1>
-                <button id="settings-toggle" class="header-icon-button settings-toggle" type="button" aria-expanded="${state.settingsOpen}" aria-controls="settings-menu" aria-label="${state.settingsOpen ? 'Hide' : 'Show'} settings" title="Settings">
-                  <span class="toggle-icon" aria-hidden="true">⚙</span>
-                </button>
-                <button class="header-icon-button" type="button" data-toggle-library-sidebar aria-pressed="true" aria-label="Hide library sidebar" title="Hide library sidebar">
-                  <span class="toggle-icon" aria-hidden="true">×</span>
-                </button>
-              </div>
-              <span class="brand-subtitle">EPUB to markdown reader</span>
-            </div>
-          </div>
-          <div class="brand-actions">
-            <button id="import-epub" class="import-button" type="button" ${state.importing || state.loading ? 'disabled' : ''}>${state.importing ? 'Importing…' : 'Import EPUB'}</button>
-          </div>
+        <div class="library-sidebar-toolbar">
+          <button id="import-epub" class="import-button" type="button" ${state.importing || state.loading ? 'disabled' : ''}>
+            <span aria-hidden="true">+</span>
+            <span>${state.importing ? 'Importing…' : 'Import EPUB'}</span>
+          </button>
+          <button id="settings-toggle" class="header-icon-button settings-toggle" type="button" aria-expanded="${state.settingsOpen}" aria-controls="settings-menu" aria-label="${state.settingsOpen ? 'Hide' : 'Show'} settings" title="Settings">
+            <span class="toggle-icon" aria-hidden="true">⚙</span>
+          </button>
+          <button class="header-icon-button" type="button" data-toggle-library-sidebar aria-pressed="true" aria-label="Hide library sidebar" title="Hide library sidebar">
+            <span class="toggle-icon" aria-hidden="true">×</span>
+          </button>
         </div>
 
         ${sidebarNavigationContent()}
         ${settingsMenuContent(resolvedColorMode)}
+        ${librarySidebarBooksContent()}
 
-        <section class="sidebar-section library-status-panel" aria-label="Library status">
-          <div class="section-heading"><span>Library</span></div>
-          <div class="library-stat-grid">
-            <span>
-              <strong>${state.library.length}</strong>
-              <small>Books</small>
-            </span>
-            <span>
-              <strong>${state.library.filter(book => book.completed).length}</strong>
-              <small>Done</small>
-            </span>
-          </div>
-        </section>
+        <footer class="library-sidebar-footer" aria-label="Library status">
+          <span>${state.library.length} book${state.library.length === 1 ? '' : 's'}</span>
+          <span>${state.library.filter(book => book.completed).length} done</span>
+        </footer>
       </aside>
       `}
       ${state.outlineSidebarHidden ? '' : `
@@ -283,10 +293,13 @@ function renderShell(options: { preserveChapterScroll?: boolean; preserveReaderS
         <div class="reader-stage">
           ${readerContent(book, current)}
         </div>
+        ${readerNavigationContent(book, current)}
       </section>
       ${libraryContextMenuContent()}
-    </main>
+      </main>
+    </div>
   `;
+  bindAppTitlebar();
   document.querySelector<HTMLButtonElement>('#settings-toggle')?.addEventListener('click', () => {
     state.settingsOpen = !state.settingsOpen;
     renderShell();
@@ -315,12 +328,29 @@ function renderShell(options: { preserveChapterScroll?: boolean; preserveReaderS
   document.querySelector<HTMLButtonElement>('#search-next')?.addEventListener('click', () => moveSearchResult(1));
   document.querySelector<HTMLButtonElement>('#search-clear')?.addEventListener('click', clearReaderSearch);
   document.querySelector<HTMLButtonElement>('#toggle-completed')?.addEventListener('click', () => void toggleSelectedBookCompleted());
+  document.querySelectorAll<HTMLButtonElement>('[data-color-mode-choice]').forEach(button => {
+    button.addEventListener('click', () => setColorMode(button.dataset.colorModeChoice as ColorMode));
+  });
+  document.querySelector<HTMLButtonElement>('#font-size-decrease')?.addEventListener('click', () => adjustReaderFontSize(-1));
+  document.querySelector<HTMLButtonElement>('#font-size-increase')?.addEventListener('click', () => adjustReaderFontSize(1));
+  document.querySelector<HTMLButtonElement>('#reader-font-menu-button')?.addEventListener('click', event => {
+    event.stopPropagation();
+    toggleReaderFontMenu();
+  });
+  document.querySelectorAll<HTMLButtonElement>('[data-reader-font-choice]').forEach(button => {
+    button.addEventListener('click', () => setReaderFontFamily(button.dataset.readerFontChoice));
+  });
   document.querySelectorAll<HTMLButtonElement>('[data-toggle-library-sidebar]').forEach(button => {
     button.addEventListener('click', toggleLibrarySidebar);
   });
   document.querySelectorAll<HTMLButtonElement>('[data-toggle-outline-sidebar]').forEach(button => {
     button.addEventListener('click', toggleOutlineSidebar);
   });
+  if (state.readerFontMenuOpen) {
+    window.setTimeout(() => {
+      document.addEventListener('click', closeReaderFontMenuFromDocument, { once: true });
+    }, 0);
+  }
   document.querySelector<HTMLButtonElement>('#home-button')?.addEventListener('click', showHome);
   document.querySelector<HTMLButtonElement>('#all-books-button')?.addEventListener('click', showHome);
   document.querySelector<HTMLButtonElement>('#done-delete-mode')?.addEventListener('click', () => {
@@ -411,6 +441,90 @@ function renderShell(options: { preserveChapterScroll?: boolean; preserveReaderS
   void renderSelectedChapter(book, current);
 }
 
+function appTitlebarContent(book: BookPayload | undefined, resolvedColorMode: ResolvedColorMode): string {
+  const matches = currentSearchMatches();
+  const hasQuery = normalizeQuery(state.readerSearchQuery).length > 0;
+  const activeSearchPosition = matches.length > 0 && state.searchActiveIndex >= 0
+    ? `${state.searchActiveIndex + 1} of ${matches.length}`
+    : hasQuery ? 'No results' : '';
+  const selectedBook = selectedLibraryBook();
+  const completed = Boolean(selectedBook?.completed);
+  const selectedFont = readerFontOption(state.readerFontFamily);
+  const appearanceButtons: Array<{ mode: ColorMode; label: string }> = [
+    { mode: 'system', label: 'System' },
+    { mode: 'daylight', label: 'Light' },
+    { mode: 'dark', label: 'Dark' },
+  ];
+  return `
+    <header class="app-titlebar" data-tauri-drag-region aria-label="Window toolbar">
+      <div class="titlebar-brand" data-tauri-drag-region>
+        <span class="preview-traffic-lights" aria-hidden="true">
+          <span></span><span></span><span></span>
+        </span>
+        <img class="titlebar-logo" src="${appLogoUrl}" alt="" aria-hidden="true" />
+        <strong data-tauri-drag-region>Goosereader</strong>
+      </div>
+      <div class="titlebar-controls" aria-label="Reader controls">
+        <div class="segmented-control appearance-segmented" role="group" aria-label="Appearance">
+          ${appearanceButtons.map(button => `
+            <button class="${state.colorMode === button.mode ? 'active' : ''}" type="button" data-color-mode-choice="${button.mode}" aria-pressed="${state.colorMode === button.mode}" title="${button.mode === 'system' ? `Following ${resolvedColorMode}` : `${button.label} appearance`}">
+              ${button.label}
+            </button>
+          `).join('')}
+        </div>
+        <div class="titlebar-stepper" aria-label="Reader font size">
+          <button id="font-size-decrease" type="button" aria-label="Decrease font size">-</button>
+          <span aria-hidden="true">Aa</span>
+          <button id="font-size-increase" type="button" aria-label="Increase font size">+</button>
+        </div>
+        <div class="titlebar-font-menu" data-font-menu>
+          <button id="reader-font-menu-button" class="titlebar-font-button" type="button" aria-haspopup="listbox" aria-expanded="${state.readerFontMenuOpen}" aria-label="Reader font family">
+            <span class="titlebar-font-current">${escapeHtml(selectedFont.label)}</span>
+            <span class="titlebar-font-chevron" aria-hidden="true">⌄</span>
+          </button>
+          ${state.readerFontMenuOpen ? `
+            <div class="titlebar-font-options" role="listbox" aria-label="Reader font choices">
+              ${readerFontOptions.map(option => `
+                <button class="titlebar-font-option ${state.readerFontFamily === option.value ? 'active' : ''}" type="button" role="option" aria-selected="${state.readerFontFamily === option.value}" data-reader-font-choice="${option.value}">
+                  <span class="font-option-check" aria-hidden="true">${state.readerFontFamily === option.value ? '✓' : ''}</span>
+                  <span class="font-option-copy">
+                    <span class="font-option-label">${escapeHtml(option.label)}</span>
+                    <span class="font-option-detail">${escapeHtml(option.detail)}</span>
+                  </span>
+                </button>
+              `).join('')}
+            </div>
+          ` : ''}
+        </div>
+      </div>
+      <div class="titlebar-actions">
+        <button id="toggle-completed" class="reader-complete-button titlebar-complete-button" type="button" aria-pressed="${completed}" ${!book ? 'disabled' : ''} title="${completed ? 'Mark as not completed' : 'Mark as completed'}">
+          <span aria-hidden="true">${completed ? '✓' : '○'}</span>
+          <span>${completed ? 'Completed' : 'Mark Complete'}</span>
+        </button>
+        <label class="reader-search-box titlebar-search-box" for="reader-search">
+          <span class="search-icon" aria-hidden="true">⌕</span>
+          <input id="reader-search" type="search" placeholder="${book ? 'Search in book' : 'Search in book'}" value="${escapeHtml(state.readerSearchQuery)}" autocomplete="off" ${!book ? 'disabled' : ''} />
+          <span class="titlebar-shortcut" aria-hidden="true">⌘F</span>
+        </label>
+        <span class="reader-search-count titlebar-search-count" aria-live="polite">${escapeHtml(activeSearchPosition)}</span>
+      </div>
+    </header>
+  `;
+}
+
+function bindAppTitlebar(): void {
+  const titlebar = document.querySelector<HTMLElement>('.app-titlebar');
+  if (!titlebar || !hasTauriRuntime()) return;
+  titlebar.addEventListener('mousedown', event => {
+    if (event.button !== 0) return;
+    const target = event.target;
+    if (target instanceof Element && target.closest('button, input, select, textarea, a, label, [data-font-menu]')) return;
+    const appWindow = getCurrentWindow();
+    if (event.detail === 2) void appWindow.toggleMaximize();
+    else void appWindow.startDragging();
+  });
+}
 
 function toggleColorMode(): void {
   state.colorMode = nextColorMode(state.colorMode);
@@ -421,6 +535,54 @@ function toggleColorMode(): void {
     // Ignore storage failures; the in-memory toggle should still work.
   }
   renderShell();
+}
+
+function setColorMode(mode: ColorMode | undefined): void {
+  if (mode !== 'system' && mode !== 'daylight' && mode !== 'dark') return;
+  state.colorMode = mode;
+  applyColorMode(resolveColorMode(state.colorMode));
+  try {
+    window.localStorage.setItem(colorModeStorageKey, state.colorMode);
+  } catch {
+    // Ignore storage failures; the in-memory toggle should still work.
+  }
+  renderShell();
+}
+
+function adjustReaderFontSize(delta: -1 | 1): void {
+  state.readerFontSizePx = clampNumber(state.readerFontSizePx + delta, minReaderFontSizePx, maxReaderFontSizePx);
+  persistReaderSettings();
+  renderShell();
+  schedulePagedLayout();
+}
+
+function toggleReaderFontMenu(): void {
+  state.readerFontMenuOpen = !state.readerFontMenuOpen;
+  renderShell();
+}
+
+function closeReaderFontMenuFromDocument(event: MouseEvent): void {
+  if (event.target instanceof Element && event.target.closest('[data-font-menu]')) return;
+  if (!state.readerFontMenuOpen) return;
+  state.readerFontMenuOpen = false;
+  renderShell();
+}
+
+function setReaderFontFamily(fontFamily: unknown): void {
+  if (!isReaderFontFamily(fontFamily)) return;
+  state.readerFontFamily = fontFamily;
+  state.readerFontMenuOpen = false;
+  persistReaderSettings();
+  renderShell();
+  schedulePagedLayout();
+}
+
+function isReaderFontFamily(fontFamily: unknown): fontFamily is ReaderFontFamily {
+  return typeof fontFamily === 'string' && readerFontOptions.some(option => option.value === fontFamily);
+}
+
+function readerFontOption(fontFamily: ReaderFontFamily): ReaderFontOption {
+  return readerFontOptions.find(option => option.value === fontFamily) ?? readerFontOptions[0];
 }
 
 function nextColorMode(mode: ColorMode): ColorMode {
@@ -525,6 +687,17 @@ function readStoredReaderMode(): ReaderMode {
   }
 }
 
+function readStoredReaderFontFamily(): ReaderFontFamily {
+  try {
+    const stored = window.localStorage.getItem(readerFontFamilyStorageKey);
+    if (stored === 'serif') return 'iowan';
+    if (stored === 'system') return 'system-sans';
+    return isReaderFontFamily(stored) ? stored : 'literata';
+  } catch {
+    return 'literata';
+  }
+}
+
 function readStoredSidebarWidth(): number {
   try {
     const stored = Number(window.localStorage.getItem(sidebarWidthStorageKey));
@@ -592,6 +765,7 @@ function persistReaderSettings(): void {
   try {
     window.localStorage.setItem(readerWidthStorageKey, String(state.readerWidthCh));
     window.localStorage.setItem(readerFontSizeStorageKey, String(state.readerFontSizePx));
+    window.localStorage.setItem(readerFontFamilyStorageKey, state.readerFontFamily);
   } catch {
     // Ignore storage failures; the current layout should still update in memory.
   }
@@ -614,6 +788,67 @@ function sidebarNavigationContent(): string {
         <span>All Books</span>
       </button>
     </nav>
+  `;
+}
+
+function librarySidebarBooksContent(): string {
+  const books = filteredLibrary();
+  if (state.libraryLoading) {
+    return '<section class="sidebar-section sidebar-book-list-panel"><div class="section-heading"><span>Library</span></div><p class="library-empty">Loading books…</p></section>';
+  }
+  if (state.library.length === 0) {
+    return '<section class="sidebar-section sidebar-book-list-panel"><div class="section-heading"><span>Library</span></div><p class="library-empty">Import EPUB files to add them here.</p></section>';
+  }
+  if (books.length === 0) {
+    return '<section class="sidebar-section sidebar-book-list-panel"><div class="section-heading"><span>Library</span></div><p class="library-empty">No matching books.</p></section>';
+  }
+
+  const continueBooks = books.filter(book => Boolean(book.progress_chapter_path) && !book.completed).slice(0, 3);
+  const libraryBooks = [...books].sort((left, right) => right.modified_ms - left.modified_ms);
+  return `
+    ${continueBooks.length > 0 ? `
+      <section class="sidebar-section sidebar-book-list-panel" aria-label="Continue reading">
+        <div class="section-heading"><span>Continue Reading</span></div>
+        <div class="sidebar-book-list">
+          ${continueBooks.map(sidebarBookItem).join('')}
+        </div>
+      </section>
+    ` : ''}
+    <section class="sidebar-section sidebar-book-list-panel sidebar-library-list-panel" aria-label="Imported EPUB library">
+      <div class="section-heading">
+        <span>Library</span>
+        <small>${books.length} book${books.length === 1 ? '' : 's'}</small>
+      </div>
+      <div class="sidebar-book-list">
+        ${libraryBooks.map(sidebarBookItem).join('')}
+      </div>
+    </section>
+  `;
+}
+
+function sidebarBookItem(book: LibraryBook): string {
+  const percent = normalizedReadingProgressPercent(book);
+  const progress = book.completed
+    ? 'Completed'
+    : percent !== undefined
+      ? `${percent}%`
+      : `${book.chapter_count} ch`;
+  const selected = book.path === state.selectedBookPath;
+  return `
+    <button class="sidebar-book-item ${selected ? 'active' : ''}" type="button" data-book="${escapeHtml(book.path)}" ${state.loading || Boolean(state.deletingBookPath) ? 'disabled' : ''} ${selected ? 'aria-current="page"' : ''}>
+      <span class="sidebar-book-cover">
+        ${bookCoverContent(book)}
+      </span>
+      <span class="sidebar-book-copy">
+        <span class="sidebar-book-title">${escapeHtml(state.loading && selected ? 'Opening…' : book.title)}</span>
+        <span class="sidebar-book-meta">${escapeHtml(progress)}</span>
+        ${percent !== undefined ? `
+          <span class="sidebar-progress-meter" aria-label="${percent}% read">
+            <span style="width: ${percent}%"></span>
+          </span>
+        ` : ''}
+      </span>
+    </button>
   `;
 }
 
@@ -708,41 +943,20 @@ function libraryContextMenuContent(): string {
 
 function readerToolbarContent(book: BookPayload | undefined, chapter: BookChapter | undefined): string {
   const visibleBooks = filteredLibrary();
-  const matches = currentSearchMatches();
-  const hasQuery = normalizeQuery(state.readerSearchQuery).length > 0;
-  const activeSearchPosition = matches.length > 0 && state.searchActiveIndex >= 0
-    ? `${state.searchActiveIndex + 1} of ${matches.length}`
-    : hasQuery ? 'No results' : '';
-  const selectedBook = selectedLibraryBook();
-  const completed = Boolean(selectedBook?.completed);
   return `
     <header class="reader-toolbar" aria-label="Reader toolbar">
       <div class="reader-toolbar-copy">
         <button class="toolbar-icon-button library-toggle-button" type="button" data-toggle-library-sidebar aria-pressed="${!state.librarySidebarHidden}" aria-label="${state.librarySidebarHidden ? 'Show' : 'Hide'} library sidebar" title="${state.librarySidebarHidden ? 'Show' : 'Hide'} library sidebar">
           <span aria-hidden="true">${state.librarySidebarHidden ? '☰' : '‹'}</span>
         </button>
-        <button class="toolbar-icon-button outline-toggle-button" type="button" data-toggle-outline-sidebar aria-pressed="${!state.outlineSidebarHidden}" aria-label="${state.outlineSidebarHidden ? 'Show' : 'Hide'} outline sidebar" title="${state.outlineSidebarHidden ? 'Show' : 'Hide'} outline sidebar">
-          <span aria-hidden="true">${state.outlineSidebarHidden ? '☰' : '×'}</span>
-        </button>
+        ${state.outlineSidebarHidden ? `
+          <button class="toolbar-icon-button outline-toggle-button" type="button" data-toggle-outline-sidebar aria-pressed="false" aria-label="Show outline sidebar" title="Show outline sidebar">
+            <span aria-hidden="true">☰</span>
+          </button>
+        ` : ''}
         <span class="reader-toolbar-title">${escapeHtml(book?.title ?? 'Home')}</span>
         <span class="reader-toolbar-subtitle">${escapeHtml(chapter?.title ?? `${visibleBooks.length} book${visibleBooks.length === 1 ? '' : 's'}`)}</span>
       </div>
-      ${book ? `
-        <div class="reader-search-controls" role="search" aria-label="Search book text">
-          <button id="toggle-completed" class="reader-complete-button" type="button" aria-pressed="${completed}" title="${completed ? 'Mark as not completed' : 'Mark as completed'}">
-            <span aria-hidden="true">${completed ? '✓' : '○'}</span>
-            <span>${completed ? 'Completed' : 'Done'}</span>
-          </button>
-          <label class="reader-search-box" for="reader-search">
-            <span class="search-icon" aria-hidden="true">⌕</span>
-            <input id="reader-search" type="search" placeholder="Search text" value="${escapeHtml(state.readerSearchQuery)}" autocomplete="off" />
-          </label>
-          <span class="reader-search-count" aria-live="polite">${escapeHtml(activeSearchPosition)}</span>
-          <button id="search-previous" class="reader-search-button" type="button" ${matches.length === 0 ? 'disabled' : ''} aria-label="Previous search result">↑</button>
-          <button id="search-next" class="reader-search-button" type="button" ${matches.length === 0 ? 'disabled' : ''} aria-label="Next search result">↓</button>
-          <button id="search-clear" class="reader-search-button" type="button" ${!hasQuery ? 'disabled' : ''} aria-label="Clear search">×</button>
-        </div>
-      ` : ''}
     </header>
   `;
 }
@@ -1006,22 +1220,29 @@ function readerContent(book: BookPayload | undefined, chapter: BookChapter | und
   if (!book || !chapter) {
     return homeContent();
   }
-  const index = book.chapters.findIndex(item => item.path === chapter.path);
   const cached = renderedChapterCache.get(chapterCacheKey(book, chapter));
   const isPaged = state.readerMode === 'paged';
   return `
     <article class="reader-card ${isPaged ? 'paged' : 'scroll'}" style="${readerPreferenceStyle()}" aria-label="Reader chapter. ${isPaged ? 'Use page controls to change pages.' : 'Swipe left or right to change chapters.'}">
       <style>${styleTagContent(scopeReaderCss(book.style_css) + "\n" + scopeReaderCss(state.themeCss ?? '') + "\n" + readerPreferenceCss() + "\n" + readerColorModeCss())}</style>
       <div class="book-content ${isPaged ? 'paged-content' : ''}" data-render-chapter="${escapeHtml(chapter.path)}">${cached ?? loadingChapterMarkup(chapter)}</div>
-      <div class="reader-nav" aria-label="Reader chapter navigation">
-        <button id="${isPaged ? 'previous-page' : 'previous-chapter'}" type="button" ${isPaged ? previousPageDisabled(index) : index <= 0 ? 'disabled' : ''}>Previous</button>
-        <span class="reader-position" aria-live="polite">
-          <span id="page-position">${isPaged ? pagePositionText(index, book.chapters.length) : `Chapter ${index + 1} of ${book.chapters.length}`}</span>
-          <span class="swipe-hint">${isPaged ? 'Use arrows or swipe to turn pages' : 'Swipe left or right to change chapters'}</span>
-        </span>
-        <button id="${isPaged ? 'next-page' : 'next-chapter'}" type="button" ${isPaged ? nextPageDisabled(index, book.chapters.length) : index >= book.chapters.length - 1 ? 'disabled' : ''}>Next</button>
-      </div>
     </article>
+  `;
+}
+
+function readerNavigationContent(book: BookPayload | undefined, chapter: BookChapter | undefined): string {
+  if (!book || !chapter || state.error) return '';
+  const index = book.chapters.findIndex(item => item.path === chapter.path);
+  const isPaged = state.readerMode === 'paged';
+  return `
+    <footer class="reader-bottom-bar" aria-label="Reader navigation">
+      <button id="${isPaged ? 'previous-page' : 'previous-chapter'}" type="button" ${isPaged ? previousPageDisabled(index) : index <= 0 ? 'disabled' : ''}>Previous</button>
+      <span class="reader-position" aria-live="polite">
+        <span id="page-position">${isPaged ? pagePositionText(index, book.chapters.length) : `Chapter ${index + 1} of ${book.chapters.length}`}</span>
+        <span class="swipe-hint">${isPaged ? 'Use arrows or swipe to turn pages' : 'Swipe left or right to change chapters'}</span>
+      </span>
+      <button id="${isPaged ? 'next-page' : 'next-chapter'}" type="button" ${isPaged ? nextPageDisabled(index, book.chapters.length) : index >= book.chapters.length - 1 ? 'disabled' : ''}>Next</button>
+    </footer>
   `;
 }
 
@@ -1038,7 +1259,24 @@ function nextPageDisabled(chapterIndex: number, chapterCount: number): string {
 }
 
 function readerPreferenceStyle(): string {
-  return `--reader-content-width: ${state.readerWidthCh}ch; --reader-font-size: ${state.readerFontSizePx}px`;
+  return [
+    `--reader-content-width: ${state.readerWidthCh}ch`,
+    `--reader-font-size: ${state.readerFontSizePx}px`,
+    `--reader-font-family: ${readerFontStack(state.readerFontFamily)}`,
+    `--reader-heading-font-family: ${readerFontStack(state.readerFontFamily)}`,
+  ].join('; ');
+}
+
+function readerFontStack(fontFamily: ReaderFontFamily): string {
+  if (fontFamily === 'new-york') return '"New York", ui-serif, Georgia, serif';
+  if (fontFamily === 'iowan') return '"Iowan Old Style", "Palatino Linotype", Palatino, Charter, "Book Antiqua", Georgia, serif';
+  if (fontFamily === 'charter') return 'Charter, "Bitstream Charter", "Iowan Old Style", Georgia, serif';
+  if (fontFamily === 'georgia') return 'Georgia, "Times New Roman", Times, serif';
+  if (fontFamily === 'palatino') return '"Palatino Linotype", Palatino, "Book Antiqua", "Iowan Old Style", Georgia, serif';
+  if (fontFamily === 'baskerville') return 'Baskerville, "Libre Baskerville", Georgia, serif';
+  if (fontFamily === 'system-sans') return 'Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
+  if (fontFamily === 'mono') return '"SF Mono", ui-monospace, Menlo, Monaco, Consolas, "Liberation Mono", monospace';
+  return '"Literata", "Iowan Old Style", "Palatino Linotype", Palatino, Charter, "Book Antiqua", Georgia, serif';
 }
 
 function readerPreferenceCss(): string {
@@ -1062,7 +1300,12 @@ function readerPreferenceCss(): string {
     .reader-card .book-content li,
     .reader-card .book-content blockquote,
     .reader-card .book-content td,
-    .reader-card .book-content th {
+    .reader-card .book-content th,
+    .reader-card .book-content span,
+    .reader-card .book-content div,
+    .reader-card .book-content section,
+    .reader-card .book-content article {
+      font-family: var(--reader-font-family) !important;
       font-size: inherit !important;
     }
   `;
@@ -1429,7 +1672,7 @@ function selectChapter(chapterPath: string, options: { fragment?: string; pageTa
   state.selectedPath = chapterPath;
   state.error = undefined;
   state.pendingFragment = options.fragment;
-  state.pendingPageTarget = options.pageTarget ?? 'start';
+  state.pendingPageTarget = options.fragment ? undefined : options.pageTarget ?? 'start';
   state.pageIndex = 0;
   state.pageCount = 1;
   if (!options.fragment) state.readerPaneScrollTop = 0;
@@ -1444,8 +1687,8 @@ function captureChapterListScroll(): void {
 }
 
 function captureReaderPaneScroll(): void {
-  const readerPane = document.querySelector<HTMLElement>('.reader-pane');
-  if (readerPane) state.readerPaneScrollTop = readerPane.scrollTop;
+  const readerScrollContainer = currentReaderScrollContainer();
+  if (readerScrollContainer) state.readerPaneScrollTop = readerScrollContainer.scrollTop;
 }
 
 function restoreChapterListScroll(): void {
@@ -1455,9 +1698,15 @@ function restoreChapterListScroll(): void {
 }
 
 function restoreReaderPaneScroll(): void {
-  const readerPane = document.querySelector<HTMLElement>('.reader-pane');
-  if (!readerPane) return;
-  readerPane.scrollTop = state.readerPaneScrollTop;
+  const readerScrollContainer = currentReaderScrollContainer();
+  if (!readerScrollContainer) return;
+  readerScrollContainer.scrollTop = state.readerPaneScrollTop;
+}
+
+function currentReaderScrollContainer(): HTMLElement | undefined {
+  return document.querySelector<HTMLElement>('.reader-stage')
+    ?? document.querySelector<HTMLElement>('.reader-pane')
+    ?? undefined;
 }
 
 function bindSidebarResize(): void {
@@ -1614,6 +1863,7 @@ function bindReaderSettings(): void {
 
 function applyReaderSettings(): void {
   document.querySelector<HTMLElement>('.reader-card')?.setAttribute('style', readerPreferenceStyle());
+  document.querySelector<HTMLElement>('.book-content')?.style.setProperty('font-family', readerFontStack(state.readerFontFamily), 'important');
 }
 
 function schedulePagedLayout(): void {
@@ -1659,6 +1909,17 @@ function applyPagedScroll(behavior: ScrollBehavior): void {
   const content = currentRenderedBookContent();
   if (!content || state.readerMode !== 'paged') return;
   content.scrollTo({ left: state.pageIndex * syncPagedPageWidth(content), behavior });
+}
+
+function pageIndexForPagedTarget(target: HTMLElement, content: HTMLElement): number {
+  const pageWidth = syncPagedPageWidth(content);
+  state.pageCount = Math.max(1, Math.ceil(content.scrollWidth / pageWidth));
+  const targetLeft = target.getBoundingClientRect().left - content.getBoundingClientRect().left + content.scrollLeft;
+  return clampNumber(
+    Math.floor(Math.max(0, targetLeft) / Math.max(1, pageWidth)),
+    0,
+    Math.max(0, state.pageCount - 1),
+  );
 }
 
 function updatePageControls(): void {
@@ -1728,7 +1989,7 @@ function bindReaderGestures(): void {
 
 function scrollReaderPaneToTop(): void {
   requestAnimationFrame(() => {
-    document.querySelector<HTMLElement>('.reader-pane')?.scrollTo({ top: 0, behavior: 'smooth' });
+    currentReaderScrollContainer()?.scrollTo({ top: 0, behavior: 'smooth' });
   });
 }
 
@@ -1831,11 +2092,7 @@ function applySearchHighlights(scope: HTMLElement, chapter: BookChapter): void {
     if (state.readerMode === 'paged') {
       const content = currentRenderedBookContent();
       if (content) {
-        state.pageIndex = clampNumber(
-          Math.floor(activeMark.offsetLeft / Math.max(1, content.clientWidth)),
-          0,
-          Math.max(0, state.pageCount - 1),
-        );
+        state.pageIndex = pageIndexForPagedTarget(activeMark, content);
         applyPagedScroll('smooth');
         updatePageControls();
       }
@@ -1901,7 +2158,27 @@ function scrollPendingFragment(): void {
   if (!fragment) return;
   const target = document.getElementById(fragment);
   if (!target) return;
-  target.scrollIntoView({ block: 'start' });
+
+  if (state.readerMode === 'paged') {
+    const content = currentRenderedBookContent();
+    if (content) {
+      state.pageIndex = pageIndexForPagedTarget(target, content);
+      applyPagedScroll('smooth');
+      updatePageControls();
+    }
+  } else {
+    const readerScrollContainer = currentReaderScrollContainer();
+    if (readerScrollContainer) {
+      const paneTop = readerScrollContainer.getBoundingClientRect().top;
+      const targetTop = target.getBoundingClientRect().top;
+      readerScrollContainer.scrollTo({
+        top: readerScrollContainer.scrollTop + targetTop - paneTop - 18,
+        behavior: 'smooth',
+      });
+    } else {
+      target.scrollIntoView({ block: 'start' });
+    }
+  }
   state.pendingFragment = undefined;
 }
 
