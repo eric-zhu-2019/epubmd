@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Reader for goosereader Markdown zip archives"
 authors = ["goosereader"]
 edition = "2021"
+license = "Apache-2.0"
 
 [lib]
 name = "goosereader_lib"

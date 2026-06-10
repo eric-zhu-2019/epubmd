@@ -7,6 +7,7 @@ use std::{
     fs::{self, File},
     io::{Read, Write},
     path::{Path, PathBuf},
+    process::Command,
     time::UNIX_EPOCH,
 };
 use zip::ZipArchive;
@@ -24,8 +25,12 @@ struct LibraryBook {
     title: String,
     chapter_count: usize,
     progress_chapter_path: Option<String>,
+    reading_progress_percent: Option<u8>,
+    completed: bool,
     modified_ms: u64,
     cover_image: Option<String>,
+    #[serde(skip)]
+    chapter_paths: Vec<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -75,10 +80,18 @@ struct ThemePayload {
     css: String,
 }
 
+#[derive(Serialize)]
+struct SystemAppearance {
+    color_mode: &'static str,
+    source: &'static str,
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 struct ReadingProgress {
     chapter_path: String,
     updated_ms: u64,
+    #[serde(default)]
+    completed: bool,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -156,9 +169,78 @@ fn save_reading_progress(path: String, chapter_path: String) -> Result<(), Strin
 }
 
 #[tauri::command]
+fn set_book_completed(
+    path: String,
+    completed: bool,
+    chapter_path: Option<String>,
+) -> Result<(), String> {
+    let books_dir = ensure_books_dir()?;
+    set_book_completed_in_dir(
+        Path::new(&path),
+        completed,
+        chapter_path.as_deref(),
+        &books_dir,
+        &progress_store_path()?,
+    )
+}
+
+#[tauri::command]
 fn delete_book(path: String) -> Result<(), String> {
     let books_dir = ensure_books_dir()?;
     delete_book_in_dir(Path::new(&path), &books_dir, &progress_store_path()?)
+}
+
+#[tauri::command]
+fn system_appearance() -> SystemAppearance {
+    platform_system_appearance().unwrap_or(SystemAppearance {
+        color_mode: "daylight",
+        source: "fallback",
+    })
+}
+
+fn appearance_from_dark_flag(is_dark: bool, source: &'static str) -> SystemAppearance {
+    SystemAppearance {
+        color_mode: if is_dark { "dark" } else { "daylight" },
+        source,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn platform_system_appearance() -> Option<SystemAppearance> {
+    let script = "tell application \"System Events\" to tell appearance preferences to get dark mode";
+    if let Ok(output) = Command::new("osascript").args(["-e", script]).output() {
+        if output.status.success() {
+            if let Some(is_dark) = parse_bool_command_output(&output.stdout) {
+                return Some(appearance_from_dark_flag(is_dark, "macOS command"));
+            }
+        }
+    }
+
+    let output = Command::new("defaults")
+        .args(["read", "-g", "AppleInterfaceStyle"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return Some(appearance_from_dark_flag(false, "macOS command"));
+    }
+    let value = String::from_utf8_lossy(&output.stdout);
+    Some(appearance_from_dark_flag(
+        value.trim().eq_ignore_ascii_case("dark"),
+        "macOS command",
+    ))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn platform_system_appearance() -> Option<SystemAppearance> {
+    None
+}
+
+fn parse_bool_command_output(output: &[u8]) -> Option<bool> {
+    match String::from_utf8_lossy(output).trim().to_ascii_lowercase().as_str() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
 }
 
 fn load_reading_progress_in_dir(
@@ -184,11 +266,50 @@ fn save_reading_progress_in_dir(
     }
     let book_path = confined_existing_book(path, books_dir)?;
     let mut store = read_progress_store_from(progress_path)?;
+    let key = progress_key(&book_path);
+    let completed = store
+        .books
+        .get(&key)
+        .map(|progress| progress.completed)
+        .unwrap_or(false);
     store.books.insert(
-        progress_key(&book_path),
+        key,
         ReadingProgress {
             chapter_path: chapter_path.to_string(),
             updated_ms: now_ms(),
+            completed,
+        },
+    );
+    write_progress_store_to(progress_path, &store)
+}
+
+fn set_book_completed_in_dir(
+    path: &Path,
+    completed: bool,
+    chapter_path: Option<&str>,
+    books_dir: &Path,
+    progress_path: &Path,
+) -> Result<(), String> {
+    let book_path = confined_existing_book(path, books_dir)?;
+    let mut store = read_progress_store_from(progress_path)?;
+    let key = progress_key(&book_path);
+    let existing = store.books.get(&key).cloned();
+    let next_chapter_path = chapter_path
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            existing
+                .as_ref()
+                .map(|progress| progress.chapter_path.clone())
+        })
+        .ok_or_else(|| "chapter path must not be empty".to_string())?;
+    store.books.insert(
+        key,
+        ReadingProgress {
+            chapter_path: next_chapter_path,
+            updated_ms: now_ms(),
+            completed,
         },
     );
     write_progress_store_to(progress_path, &store)
@@ -337,11 +458,16 @@ fn list_books_in_dir_with_progress(
         match summarize_book(&path) {
             Ok(mut book) => {
                 book.progress_chapter_path = progress_for_path(&progress, &path);
+                book.reading_progress_percent =
+                    progress_percent_for_path(&progress, &path, &book.chapter_paths);
+                book.completed = completed_for_path(&progress, &path);
                 books.push(book);
             }
             Err(_) => {
                 let mut book = fallback_library_book(&path);
                 book.progress_chapter_path = progress_for_path(&progress, &path);
+                book.reading_progress_percent = None;
+                book.completed = completed_for_path(&progress, &path);
                 books.push(book);
             }
         }
@@ -391,7 +517,7 @@ fn summarize_book(path: &Path) -> Result<LibraryBook, String> {
     let mut archive =
         ZipArchive::new(file).map_err(|error| format!("invalid book archive: {error}"))?;
     let mut readme = String::new();
-    let mut chapter_count = 0;
+    let mut chapter_paths = Vec::new();
     let mut metadata = BookMetadata::default();
     let mut asset_paths = Vec::new();
 
@@ -409,15 +535,18 @@ fn summarize_book(path: &Path) -> Result<LibraryBook, String> {
             let text = read_utf8_entry(&mut entry, &entry_path)?;
             metadata = serde_json::from_str(&text).unwrap_or_default();
         } else if entry_path.starts_with("chapters/") && entry_path.ends_with(".md") {
-            chapter_count += 1;
+            chapter_paths.push(entry_path);
         } else if entry_path.starts_with("assets/") && is_image_path(&entry_path) {
             asset_paths.push(entry_path);
         }
     }
 
+    order_chapter_paths_from_readme(&mut chapter_paths, &readme);
+
     let mut book = fallback_library_book(path);
     book.title = title_from_readme(&readme).unwrap_or(book.title);
-    book.chapter_count = chapter_count;
+    book.chapter_count = chapter_paths.len();
+    book.chapter_paths = chapter_paths;
     book.cover_image = choose_cover_asset_path(&asset_paths, metadata.cover_asset_path.as_deref())
         .and_then(|cover_path| read_asset_data_url_from_archive(&mut archive, &cover_path).ok());
     Ok(book)
@@ -440,8 +569,11 @@ fn fallback_library_book(path: &Path) -> LibraryBook {
         title,
         chapter_count: 0,
         progress_chapter_path: None,
+        reading_progress_percent: None,
+        completed: false,
         modified_ms: modified_ms(path),
         cover_image: None,
+        chapter_paths: Vec::new(),
     }
 }
 
@@ -481,14 +613,42 @@ fn progress_store_path() -> Result<PathBuf, String> {
 }
 
 fn progress_for_path(store: &ReadingProgressStore, path: &Path) -> Option<String> {
+    progress_entry_for_path(store, path)
+        .filter(|progress| !progress.completed)
+        .map(|progress| progress.chapter_path.clone())
+}
+
+fn progress_percent_for_path(
+    store: &ReadingProgressStore,
+    path: &Path,
+    chapter_paths: &[String],
+) -> Option<u8> {
+    let progress = progress_entry_for_path(store, path)?;
+    if progress.completed || chapter_paths.is_empty() {
+        return None;
+    }
+    let chapter_index = chapter_paths
+        .iter()
+        .position(|chapter_path| chapter_path == &progress.chapter_path)?;
+    let percent = (((chapter_index + 1) as f64 / chapter_paths.len() as f64) * 100.0).round() as u8;
+    Some(percent.clamp(1, 99))
+}
+
+fn completed_for_path(store: &ReadingProgressStore, path: &Path) -> bool {
+    progress_entry_for_path(store, path)
+        .map(|progress| progress.completed)
+        .unwrap_or(false)
+}
+
+fn progress_entry_for_path<'a>(
+    store: &'a ReadingProgressStore,
+    path: &Path,
+) -> Option<&'a ReadingProgress> {
     let key = path
         .canonicalize()
         .map(|path| progress_key(&path))
         .unwrap_or_else(|_| progress_key(path));
-    store
-        .books
-        .get(&key)
-        .map(|progress| progress.chapter_path.clone())
+    store.books.get(&key)
 }
 
 fn progress_key(path: &Path) -> String {
@@ -644,6 +804,25 @@ fn normalize_zip_path(path: &str) -> String {
     path.replace('\\', "/").trim_start_matches("./").to_string()
 }
 
+fn order_chapter_paths_from_readme(chapter_paths: &mut [String], readme: &str) {
+    let toc = readme_chapter_links(readme);
+    if toc.is_empty() {
+        chapter_paths.sort();
+        return;
+    }
+
+    chapter_paths.sort_by(|left, right| {
+        let left_index = toc.iter().position(|(_, path)| path == left);
+        let right_index = toc.iter().position(|(_, path)| path == right);
+        match (left_index, right_index) {
+            (Some(left_index), Some(right_index)) => left_index.cmp(&right_index),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => left.cmp(right),
+        }
+    });
+}
+
 fn order_chapters_from_readme(chapters: &mut [BookChapter], readme: &str) {
     let toc = readme_chapter_links(readme);
     if toc.is_empty() {
@@ -796,6 +975,8 @@ pub fn run() {
             load_theme_css,
             load_theme_file,
             save_reading_progress,
+            set_book_completed,
+            system_appearance,
             delete_book
         ])
         .run(tauri::generate_context!())
@@ -807,8 +988,9 @@ mod tests {
     use super::{
         delete_book_in_dir, list_books_in_dir, list_books_in_dir_with_progress, list_themes_in_dir,
         load_book_archive, load_book_file_in_dir, load_reading_progress_in_dir,
-        load_theme_css_in_dir, order_chapters_from_readme, read_progress_store_from,
-        save_reading_progress_in_dir, unique_import_destination, BookChapter,
+        load_theme_css_in_dir, order_chapters_from_readme, parse_bool_command_output,
+        read_progress_store_from, save_reading_progress_in_dir, set_book_completed_in_dir,
+        unique_import_destination, BookChapter,
     };
     use std::{fs::File, io::Write};
     use zip::{write::SimpleFileOptions, ZipWriter};
@@ -962,6 +1144,13 @@ mod tests {
     }
 
     #[test]
+    fn parses_macos_dark_mode_command_output() {
+        assert_eq!(parse_bool_command_output(b"true\n"), Some(true));
+        assert_eq!(parse_bool_command_output(b"false\n"), Some(false));
+        assert_eq!(parse_bool_command_output(b"unexpected\n"), None);
+    }
+
+    #[test]
     fn saves_loads_and_deletes_book_progress() {
         let root =
             std::env::temp_dir().join(format!("goosereader-progress-test-{}", std::process::id()));
@@ -982,6 +1171,7 @@ mod tests {
             .expect("load progress")
             .expect("progress exists");
         assert_eq!(progress.chapter_path, "chapters/001-One.md");
+        assert!(!progress.completed);
 
         let progress_store = read_progress_store_from(&progress_path).expect("read progress store");
         let books =
@@ -990,6 +1180,40 @@ mod tests {
             books[0].progress_chapter_path.as_deref(),
             Some("chapters/001-One.md")
         );
+        assert_eq!(books[0].reading_progress_percent, Some(99));
+        assert!(!books[0].completed);
+
+        set_book_completed_in_dir(
+            &book_path,
+            true,
+            Some("chapters/001-One.md"),
+            &books_dir,
+            &progress_path,
+        )
+        .expect("mark completed");
+        let progress = load_reading_progress_in_dir(&book_path, &books_dir, &progress_path)
+            .expect("load completed progress")
+            .expect("progress exists");
+        assert_eq!(progress.chapter_path, "chapters/001-One.md");
+        assert!(progress.completed);
+        let progress_store = read_progress_store_from(&progress_path).expect("read progress store");
+        let books =
+            list_books_in_dir_with_progress(&books_dir, &progress_store).expect("list books");
+        assert_eq!(books[0].progress_chapter_path, None);
+        assert_eq!(books[0].reading_progress_percent, None);
+        assert!(books[0].completed);
+
+        set_book_completed_in_dir(&book_path, false, None, &books_dir, &progress_path)
+            .expect("mark not completed");
+        let progress_store = read_progress_store_from(&progress_path).expect("read progress store");
+        let books =
+            list_books_in_dir_with_progress(&books_dir, &progress_store).expect("list books");
+        assert_eq!(
+            books[0].progress_chapter_path.as_deref(),
+            Some("chapters/001-One.md")
+        );
+        assert_eq!(books[0].reading_progress_percent, Some(99));
+        assert!(!books[0].completed);
 
         delete_book_in_dir(&book_path, &books_dir, &progress_path).expect("delete book");
 

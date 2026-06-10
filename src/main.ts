@@ -1,5 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
+import { getCurrentWindow, type Theme } from '@tauri-apps/api/window';
 import DOMPurify from 'dompurify';
 import { marked } from 'marked';
 import { extractChapterSections, type ChapterSection } from './chapterSections';
@@ -15,6 +16,8 @@ type LibraryBook = {
   title: string;
   chapter_count: number;
   progress_chapter_path?: string | null;
+  reading_progress_percent?: number | null;
+  completed: boolean;
   modified_ms: number;
   cover_image?: string | null;
 };
@@ -59,9 +62,15 @@ type ImportPayload = {
   payload: BookPayload;
 };
 
+type SystemAppearancePayload = {
+  color_mode: ResolvedColorMode;
+  source: string;
+};
+
 type ReadingProgress = {
   chapter_path: string;
   updated_ms: number;
+  completed: boolean;
 };
 
 type ColorMode = 'system' | 'daylight' | 'dark';
@@ -94,6 +103,8 @@ type ReaderState = {
   colorMode: ColorMode;
   readerMode: ReaderMode;
   sidebarWidth: number;
+  librarySidebarHidden: boolean;
+  outlineSidebarHidden: boolean;
   readerWidthCh: number;
   readerFontSizePx: number;
   settingsOpen: boolean;
@@ -116,6 +127,8 @@ type ReaderState = {
 const colorModeStorageKey = 'goosereader:color-mode';
 const readerModeStorageKey = 'goosereader:reader-mode';
 const sidebarWidthStorageKey = 'goosereader:sidebar-width';
+const librarySidebarHiddenStorageKey = 'goosereader:library-sidebar-hidden';
+const outlineSidebarHiddenStorageKey = 'goosereader:outline-sidebar-hidden';
 const readerWidthStorageKey = 'goosereader:reader-width-ch';
 const readerFontSizeStorageKey = 'goosereader:reader-font-size-px';
 const defaultSidebarWidth = 320;
@@ -142,6 +155,8 @@ const state: ReaderState = {
   colorMode: readStoredColorMode(),
   readerMode: readStoredReaderMode(),
   sidebarWidth: readStoredSidebarWidth(),
+  librarySidebarHidden: readStoredBoolean(librarySidebarHiddenStorageKey, false),
+  outlineSidebarHidden: readStoredBoolean(outlineSidebarHiddenStorageKey, false),
   readerWidthCh: readStoredNumber(readerWidthStorageKey, defaultReaderWidthCh, minReaderWidthCh, maxReaderWidthCh),
   readerFontSizePx: readStoredNumber(readerFontSizeStorageKey, defaultReaderFontSizePx, minReaderFontSizePx, maxReaderFontSizePx),
   settingsOpen: false,
@@ -159,6 +174,8 @@ const app: HTMLDivElement = appElement;
 const renderedChapterCache = new Map<string, string>();
 const assetIndexCache = new WeakMap<BookPayload, Map<string, string>>();
 const systemColorScheme = window.matchMedia('(prefers-color-scheme: dark)');
+let nativeResolvedColorMode: ResolvedColorMode | undefined;
+let nativeResolvedColorModeSource = '';
 let swipeStart: GesturePoint | undefined;
 let suppressNextReaderClickUntil = 0;
 let accumulatedHorizontalWheelDelta = 0;
@@ -187,9 +204,15 @@ function renderShell(options: { preserveChapterScroll?: boolean; preserveReaderS
   const book = state.book;
   const current = currentChapter();
   const resolvedColorMode = resolveColorMode(state.colorMode);
+  const shellClasses = [
+    'shell',
+    state.librarySidebarHidden ? 'library-hidden' : '',
+    state.outlineSidebarHidden ? 'outline-hidden' : '',
+  ].filter(Boolean).join(' ');
   app.innerHTML = `
-    <main class="shell" style="--sidebar-width: ${state.sidebarWidth}px">
-      <aside class="sidebar">
+    <main class="${shellClasses}" style="--library-column-width: ${state.librarySidebarHidden ? '0px' : 'var(--library-width)'}; --sidebar-width: ${state.outlineSidebarHidden ? 0 : state.sidebarWidth}px">
+      ${state.librarySidebarHidden ? '' : `
+      <aside class="library-sidebar">
         <div class="brand">
           <div class="brand-lockup">
             <img class="brand-logo" src="${appLogoUrl}" alt="" aria-hidden="true" />
@@ -199,11 +222,11 @@ function renderShell(options: { preserveChapterScroll?: boolean; preserveReaderS
                 <button id="settings-toggle" class="header-icon-button settings-toggle" type="button" aria-expanded="${state.settingsOpen}" aria-controls="settings-menu" aria-label="${state.settingsOpen ? 'Hide' : 'Show'} settings" title="Settings">
                   <span class="toggle-icon" aria-hidden="true">⚙</span>
                 </button>
-                <button id="color-mode-toggle" class="header-icon-button color-mode-toggle" type="button" aria-pressed="${resolvedColorMode === 'dark'}" aria-label="${colorModeToggleLabel()}" title="${colorModeToggleLabel()}">
-                  <span class="toggle-icon" aria-hidden="true">${colorModeIcon()}</span>
+                <button class="header-icon-button" type="button" data-toggle-library-sidebar aria-pressed="true" aria-label="Hide library sidebar" title="Hide library sidebar">
+                  <span class="toggle-icon" aria-hidden="true">×</span>
                 </button>
               </div>
-              <span class="brand-subtitle">Markdown goose reader</span>
+              <span class="brand-subtitle">EPUB to markdown reader</span>
             </div>
           </div>
           <div class="brand-actions">
@@ -212,11 +235,31 @@ function renderShell(options: { preserveChapterScroll?: boolean; preserveReaderS
         </div>
 
         ${sidebarNavigationContent()}
-        ${settingsMenuContent()}
+        ${settingsMenuContent(resolvedColorMode)}
 
+        <section class="sidebar-section library-status-panel" aria-label="Library status">
+          <div class="section-heading"><span>Library</span></div>
+          <div class="library-stat-grid">
+            <span>
+              <strong>${state.library.length}</strong>
+              <small>Books</small>
+            </span>
+            <span>
+              <strong>${state.library.filter(book => book.completed).length}</strong>
+              <small>Done</small>
+            </span>
+          </div>
+        </section>
+      </aside>
+      `}
+      ${state.outlineSidebarHidden ? '' : `
+      <aside class="outline-sidebar">
         <section class="sidebar-section chapter-panel" aria-label="Chapters">
-          <div class="section-heading"><span>Chapters</span></div>
-          <p class="book-title">${escapeHtml(book?.title ?? 'Select a book to start reading.')}</p>
+          <div class="section-heading outline-heading">
+            <span>Outline</span>
+            <button class="link-button icon-link-button" type="button" data-toggle-outline-sidebar aria-pressed="true" aria-label="Hide outline sidebar" title="Hide outline sidebar">×</button>
+          </div>
+          <p class="book-title">${escapeHtml(book?.title ?? 'Select a book to browse chapters.')}</p>
           <nav class="chapter-list" aria-label="Chapters">
             ${chapterListContent(book)}
           </nav>
@@ -234,6 +277,7 @@ function renderShell(options: { preserveChapterScroll?: boolean; preserveReaderS
           title="Drag to resize sidebar"
         ></div>
       </aside>
+      `}
       <section class="reader-pane">
         ${readerToolbarContent(book, current)}
         <div class="reader-stage">
@@ -270,6 +314,13 @@ function renderShell(options: { preserveChapterScroll?: boolean; preserveReaderS
   document.querySelector<HTMLButtonElement>('#search-previous')?.addEventListener('click', () => moveSearchResult(-1));
   document.querySelector<HTMLButtonElement>('#search-next')?.addEventListener('click', () => moveSearchResult(1));
   document.querySelector<HTMLButtonElement>('#search-clear')?.addEventListener('click', clearReaderSearch);
+  document.querySelector<HTMLButtonElement>('#toggle-completed')?.addEventListener('click', () => void toggleSelectedBookCompleted());
+  document.querySelectorAll<HTMLButtonElement>('[data-toggle-library-sidebar]').forEach(button => {
+    button.addEventListener('click', toggleLibrarySidebar);
+  });
+  document.querySelectorAll<HTMLButtonElement>('[data-toggle-outline-sidebar]').forEach(button => {
+    button.addEventListener('click', toggleOutlineSidebar);
+  });
   document.querySelector<HTMLButtonElement>('#home-button')?.addEventListener('click', showHome);
   document.querySelector<HTMLButtonElement>('#all-books-button')?.addEventListener('click', showHome);
   document.querySelector<HTMLButtonElement>('#done-delete-mode')?.addEventListener('click', () => {
@@ -393,11 +444,68 @@ function colorModeToggleLabel(): string {
 
 function resolveColorMode(mode: ColorMode): ResolvedColorMode {
   if (mode !== 'system') return mode;
-  return systemColorScheme.matches ? 'dark' : 'daylight';
+  return nativeResolvedColorMode ?? (systemColorScheme.matches ? 'dark' : 'daylight');
 }
 
 function applyColorMode(mode: ResolvedColorMode): void {
   document.documentElement.dataset.colorMode = mode;
+}
+
+function resolveNativeTheme(theme: Theme | null): ResolvedColorMode | undefined {
+  if (theme === 'dark') return 'dark';
+  if (theme === 'light') return 'daylight';
+  return undefined;
+}
+
+function hasTauriRuntime(): boolean {
+  return typeof (window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ === 'object';
+}
+
+function applyNativeResolvedColorMode(nextMode: ResolvedColorMode | undefined, source: string): void {
+  if (!nextMode) return;
+  const changed = nextMode !== nativeResolvedColorMode || source !== nativeResolvedColorModeSource;
+  nativeResolvedColorMode = nextMode;
+  nativeResolvedColorModeSource = source;
+  if (!changed) return;
+  if (state.colorMode !== 'system') return;
+  applyColorMode(resolveColorMode(state.colorMode));
+  renderShell();
+}
+
+async function bindNativeColorMode(): Promise<void> {
+  if (!hasTauriRuntime()) return;
+
+  const refreshCommandAppearance = async (): Promise<boolean> => {
+    try {
+      const systemAppearance = await invoke<SystemAppearancePayload>('system_appearance');
+      applyNativeResolvedColorMode(systemAppearance.color_mode, systemAppearance.source);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  const appWindow = getCurrentWindow();
+  let hasWindowTheme = false;
+  try {
+    const windowTheme = resolveNativeTheme(await appWindow.theme());
+    if (windowTheme) {
+      applyNativeResolvedColorMode(windowTheme, 'system window');
+      hasWindowTheme = true;
+    } else {
+      await refreshCommandAppearance();
+    }
+  } catch {
+    await refreshCommandAppearance();
+  }
+
+  try {
+    await appWindow.onThemeChanged(({ payload }) => {
+      applyNativeResolvedColorMode(resolveNativeTheme(payload), 'system window');
+    });
+  } catch {
+    if (!hasWindowTheme) await refreshCommandAppearance();
+  }
 }
 
 function readStoredColorMode(): ColorMode {
@@ -426,6 +534,17 @@ function readStoredSidebarWidth(): number {
   }
 }
 
+function readStoredBoolean(key: string, fallback: boolean): boolean {
+  try {
+    const stored = window.localStorage.getItem(key);
+    if (stored === 'true') return true;
+    if (stored === 'false') return false;
+    return fallback;
+  } catch {
+    return fallback;
+  }
+}
+
 function readStoredNumber(key: string, fallback: number, min: number, max: number): number {
   try {
     const stored = Number(window.localStorage.getItem(key));
@@ -437,6 +556,28 @@ function readStoredNumber(key: string, fallback: number, min: number, max: numbe
 
 function clampNumber(value: number, min: number, max: number): number {
   return Math.round(Math.min(max, Math.max(min, value)));
+}
+
+function toggleOutlineSidebar(): void {
+  state.outlineSidebarHidden = !state.outlineSidebarHidden;
+  try {
+    window.localStorage.setItem(outlineSidebarHiddenStorageKey, String(state.outlineSidebarHidden));
+  } catch {
+    // Keep the in-memory state even if persistence is unavailable.
+  }
+  renderShell();
+  schedulePagedLayout();
+}
+
+function toggleLibrarySidebar(): void {
+  state.librarySidebarHidden = !state.librarySidebarHidden;
+  try {
+    window.localStorage.setItem(librarySidebarHiddenStorageKey, String(state.librarySidebarHidden));
+  } catch {
+    // Keep the in-memory state even if persistence is unavailable.
+  }
+  renderShell();
+  schedulePagedLayout();
 }
 
 function persistSidebarWidth(): void {
@@ -476,10 +617,21 @@ function sidebarNavigationContent(): string {
   `;
 }
 
-function settingsMenuContent(): string {
+function settingsMenuContent(resolvedColorMode: ResolvedColorMode): string {
   if (!state.settingsOpen) return '';
   return `
     <div id="settings-menu" class="settings-menu" role="region" aria-label="Settings">
+      <section class="sidebar-section appearance-panel" aria-label="Appearance controls">
+        <div class="section-heading"><span>Appearance</span></div>
+        <button id="color-mode-toggle" class="appearance-toggle" type="button" aria-pressed="${resolvedColorMode === 'dark'}" aria-label="${colorModeToggleLabel()}" title="${colorModeToggleLabel()}">
+          <span class="appearance-toggle-icon" aria-hidden="true">${colorModeIcon()}</span>
+          <span>
+            <strong>${colorModeTitle()}</strong>
+            <small>${colorModeSubtitle()}</small>
+          </span>
+        </button>
+      </section>
+
       <section class="sidebar-section theme-panel" aria-label="Theme controls">
         <div class="section-heading">
           <span>Theme</span>
@@ -526,6 +678,20 @@ function settingsMenuContent(): string {
   `;
 }
 
+function colorModeTitle(): string {
+  if (state.colorMode === 'system') return 'System';
+  return state.colorMode === 'daylight' ? 'Daylight' : 'Dark';
+}
+
+function colorModeSubtitle(): string {
+  if (state.colorMode === 'system') return `Following ${resolveColorMode(state.colorMode)} (${colorModeSourceLabel()})`;
+  return 'Click to change';
+}
+
+function colorModeSourceLabel(): string {
+  return nativeResolvedColorModeSource || 'browser preview';
+}
+
 function libraryContextMenuContent(): string {
   const menu = state.libraryContextMenu;
   if (!menu) return '';
@@ -547,14 +713,26 @@ function readerToolbarContent(book: BookPayload | undefined, chapter: BookChapte
   const activeSearchPosition = matches.length > 0 && state.searchActiveIndex >= 0
     ? `${state.searchActiveIndex + 1} of ${matches.length}`
     : hasQuery ? 'No results' : '';
+  const selectedBook = selectedLibraryBook();
+  const completed = Boolean(selectedBook?.completed);
   return `
     <header class="reader-toolbar" aria-label="Reader toolbar">
       <div class="reader-toolbar-copy">
+        <button class="toolbar-icon-button library-toggle-button" type="button" data-toggle-library-sidebar aria-pressed="${!state.librarySidebarHidden}" aria-label="${state.librarySidebarHidden ? 'Show' : 'Hide'} library sidebar" title="${state.librarySidebarHidden ? 'Show' : 'Hide'} library sidebar">
+          <span aria-hidden="true">${state.librarySidebarHidden ? '☰' : '‹'}</span>
+        </button>
+        <button class="toolbar-icon-button outline-toggle-button" type="button" data-toggle-outline-sidebar aria-pressed="${!state.outlineSidebarHidden}" aria-label="${state.outlineSidebarHidden ? 'Show' : 'Hide'} outline sidebar" title="${state.outlineSidebarHidden ? 'Show' : 'Hide'} outline sidebar">
+          <span aria-hidden="true">${state.outlineSidebarHidden ? '☰' : '×'}</span>
+        </button>
         <span class="reader-toolbar-title">${escapeHtml(book?.title ?? 'Home')}</span>
         <span class="reader-toolbar-subtitle">${escapeHtml(chapter?.title ?? `${visibleBooks.length} book${visibleBooks.length === 1 ? '' : 's'}`)}</span>
       </div>
       ${book ? `
         <div class="reader-search-controls" role="search" aria-label="Search book text">
+          <button id="toggle-completed" class="reader-complete-button" type="button" aria-pressed="${completed}" title="${completed ? 'Mark as not completed' : 'Mark as completed'}">
+            <span aria-hidden="true">${completed ? '✓' : '○'}</span>
+            <span>${completed ? 'Completed' : 'Done'}</span>
+          </button>
           <label class="reader-search-box" for="reader-search">
             <span class="search-icon" aria-hidden="true">⌕</span>
             <input id="reader-search" type="search" placeholder="Search text" value="${escapeHtml(state.readerSearchQuery)}" autocomplete="off" />
@@ -567,6 +745,10 @@ function readerToolbarContent(book: BookPayload | undefined, chapter: BookChapte
       ` : ''}
     </header>
   `;
+}
+
+function selectedLibraryBook(): LibraryBook | undefined {
+  return state.selectedBookPath ? state.library.find(book => book.path === state.selectedBookPath) : undefined;
 }
 
 function filteredLibrary(): LibraryBook[] {
@@ -650,13 +832,12 @@ function showHome(): void {
 
 function homeContent(): string {
   const books = filteredLibrary();
-  const continueBooks = books.filter(book => Boolean(book.progress_chapter_path));
+  const continueBooks = books.filter(book => Boolean(book.progress_chapter_path) && !book.completed);
   const recentBooks = [...books].sort((left, right) => right.modified_ms - left.modified_ms).slice(0, 10);
   return `
     <section class="home-view" aria-label="Library home">
       <header class="home-header">
         <div>
-          <span class="home-kicker">Local EPUB Library</span>
           <h2>Home</h2>
         </div>
         <div class="home-header-actions">
@@ -682,7 +863,7 @@ function homeIntroContent(books: LibraryBook[]): string {
     return `
       <div class="home-empty-card">
         <strong>Build your bookshelf</strong>
-        <span>Import EPUB files and goosereader will show them here as horizontal shelves.</span>
+        <span>Import EPUB files to add them here.</span>
       </div>
     `;
   }
@@ -715,7 +896,14 @@ function bookShelf(title: string, books: LibraryBook[], subtitle: string, varian
 }
 
 function bookCard(book: LibraryBook, variant: 'continue' | 'cover'): string {
-  const progress = book.progress_chapter_path ? 'Progress saved' : `${book.chapter_count} chapter${book.chapter_count === 1 ? '' : 's'}`;
+  const percent = normalizedReadingProgressPercent(book);
+  const progress = book.completed
+    ? 'Completed'
+    : percent !== undefined
+      ? `${percent}% read`
+      : book.progress_chapter_path
+        ? 'Progress saved'
+        : `${book.chapter_count} chapter${book.chapter_count === 1 ? '' : 's'}`;
   return `
     <div class="home-book-card ${variant} ${state.homeDeleteMode ? 'delete-mode' : ''}" data-home-book-card data-menu-book="${escapeHtml(book.path)}" data-menu-title="${escapeHtml(book.title)}">
       <button class="home-book-open ${variant}" type="button" data-book="${escapeHtml(book.path)}" ${state.loading || Boolean(state.deletingBookPath) ? 'disabled' : ''}>
@@ -723,6 +911,11 @@ function bookCard(book: LibraryBook, variant: 'continue' | 'cover'): string {
         <span class="home-book-copy">
           <span class="home-book-title">${escapeHtml(state.loading && book.path === state.selectedBookPath ? 'Opening…' : book.title)}</span>
           <span class="home-book-meta">${escapeHtml(progress)}</span>
+          ${variant === 'continue' && percent !== undefined ? `
+            <span class="home-progress-meter" aria-label="${percent}% read">
+              <span style="width: ${percent}%"></span>
+            </span>
+          ` : ''}
         </span>
       </button>
       ${state.homeDeleteMode ? `
@@ -732,6 +925,19 @@ function bookCard(book: LibraryBook, variant: 'continue' | 'cover'): string {
       ` : ''}
     </div>
   `;
+}
+
+function normalizedReadingProgressPercent(book: LibraryBook): number | undefined {
+  if (book.completed) return 100;
+  if (typeof book.reading_progress_percent !== 'number' || Number.isNaN(book.reading_progress_percent)) return undefined;
+  return Math.max(1, Math.min(99, Math.round(book.reading_progress_percent)));
+}
+
+function selectedBookProgressPercent(): number | null {
+  if (!state.book || !state.selectedPath || state.book.chapters.length === 0) return null;
+  const chapterIndex = state.book.chapters.findIndex(chapter => chapter.path === state.selectedPath);
+  if (chapterIndex < 0) return null;
+  return Math.max(1, Math.min(99, Math.round(((chapterIndex + 1) / state.book.chapters.length) * 100)));
 }
 
 function bookCoverContent(book: LibraryBook): string {
@@ -839,7 +1045,17 @@ function readerPreferenceCss(): string {
   return `
     .reader-card .book-content {
       max-width: var(--reader-content-width) !important;
+      font-family: var(--reader-font-family) !important;
       font-size: var(--reader-font-size) !important;
+    }
+
+    .reader-card .book-content h1,
+    .reader-card .book-content h2,
+    .reader-card .book-content h3,
+    .reader-card .book-content h4,
+    .reader-card .book-content h5,
+    .reader-card .book-content h6 {
+      font-family: var(--reader-heading-font-family) !important;
     }
 
     .reader-card .book-content p,
@@ -1013,6 +1229,28 @@ async function loadReadingProgress(path: string): Promise<ReadingProgress | unde
   return progress ?? undefined;
 }
 
+async function toggleSelectedBookCompleted(): Promise<void> {
+  if (!state.selectedBookPath || !state.selectedPath) return;
+  const book = selectedLibraryBook();
+  const completed = !book?.completed;
+  try {
+    await invoke<void>('set_book_completed', {
+      path: state.selectedBookPath,
+      completed,
+      chapterPath: state.selectedPath,
+    });
+    if (book) {
+      book.completed = completed;
+      book.progress_chapter_path = completed ? null : state.selectedPath;
+      book.reading_progress_percent = completed ? null : selectedBookProgressPercent();
+    }
+    renderShell({ preserveReaderScroll: true });
+  } catch (error) {
+    state.libraryError = error instanceof Error ? error.message : String(error);
+    renderShell({ preserveReaderScroll: true });
+  }
+}
+
 async function saveCurrentReadingProgress(): Promise<void> {
   if (!state.selectedBookPath || !state.selectedPath) return;
   try {
@@ -1020,8 +1258,11 @@ async function saveCurrentReadingProgress(): Promise<void> {
       path: state.selectedBookPath,
       chapterPath: state.selectedPath,
     });
-    const book = state.library.find(book => book.path === state.selectedBookPath);
-    if (book) book.progress_chapter_path = state.selectedPath;
+    const book = selectedLibraryBook();
+    if (book) {
+      book.progress_chapter_path = book.completed ? null : state.selectedPath;
+      book.reading_progress_percent = book.completed ? null : selectedBookProgressPercent();
+    }
   } catch (error) {
     state.libraryError = error instanceof Error ? error.message : String(error);
     renderShell();
@@ -1222,7 +1463,8 @@ function restoreReaderPaneScroll(): void {
 function bindSidebarResize(): void {
   const handle = document.querySelector<HTMLElement>('#sidebar-resize-handle');
   const shell = document.querySelector<HTMLElement>('.shell');
-  if (!handle || !shell) return;
+  const outline = document.querySelector<HTMLElement>('.outline-sidebar');
+  if (!handle || !shell || !outline) return;
 
   const applyWidth = (width: number): void => {
     const clamped = clampSidebarWidth(width);
@@ -1238,8 +1480,8 @@ function bindSidebarResize(): void {
     document.body.classList.add('is-resizing-sidebar');
 
     const resizeTo = (clientX: number): void => {
-      const shellLeft = shell.getBoundingClientRect().left;
-      applyWidth(clientX - shellLeft);
+      const outlineLeft = outline.getBoundingClientRect().left;
+      applyWidth(clientX - outlineLeft);
     };
     const onPointerMove = (moveEvent: PointerEvent): void => {
       if (!moveEvent.isPrimary) return;
@@ -1387,7 +1629,7 @@ function updatePagedLayout(): void {
   requestAnimationFrame(() => {
     const content = currentRenderedBookContent();
     if (!content) return;
-    const pageWidth = Math.max(1, content.clientWidth);
+    const pageWidth = syncPagedPageWidth(content);
     const pageCount = Math.max(1, Math.ceil(content.scrollWidth / pageWidth));
     state.pageCount = pageCount;
     if (state.pendingPageTarget === 'end') {
@@ -1407,10 +1649,16 @@ function currentRenderedBookContent(): HTMLElement | undefined {
   return document.querySelector<HTMLElement>(`.book-content[data-render-chapter="${cssString(chapter.path)}"]`) ?? undefined;
 }
 
+function syncPagedPageWidth(content: HTMLElement): number {
+  const pageWidth = Math.max(1, content.clientWidth);
+  content.style.setProperty('--paged-page-width', `${pageWidth}px`);
+  return pageWidth;
+}
+
 function applyPagedScroll(behavior: ScrollBehavior): void {
   const content = currentRenderedBookContent();
   if (!content || state.readerMode !== 'paged') return;
-  content.scrollTo({ left: state.pageIndex * content.clientWidth, behavior });
+  content.scrollTo({ left: state.pageIndex * syncPagedPageWidth(content), behavior });
 }
 
 function updatePageControls(): void {
@@ -1711,4 +1959,5 @@ systemColorScheme.addEventListener('change', () => {
 });
 
 renderShell();
+void bindNativeColorMode();
 void bootstrap();

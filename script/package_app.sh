@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP_NAME="epubmd"
+APP_NAME="goosereader"
 VERSION="0.1.0"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SOURCE_APP="$ROOT_DIR/src-tauri/target/release/bundle/macos/$APP_NAME.app"
 DIST_DIR="$ROOT_DIR/dist"
 DIST_APP="$DIST_DIR/$APP_NAME.app"
-ZIP_PATH="$DIST_DIR/$APP_NAME-reader-$VERSION.zip"
+ZIP_PATH="$DIST_DIR/$APP_NAME-$VERSION.zip"
 
 cd "$ROOT_DIR"
 npm run tauri:build

@@ -1486,7 +1486,7 @@ fn insert_fragment_output_paths(
         let mut segment_positions = segments
             .iter()
             .filter(|segment| segment.start.spine_index == spine_index)
-            .filter_map(|segment| {
+            .map(|segment| {
                 let position = segment
                     .start
                     .fragment
@@ -1494,7 +1494,7 @@ fn insert_fragment_output_paths(
                     .and_then(|fragment| anchor_position_by_id.get(fragment))
                     .copied()
                     .unwrap_or(0);
-                Some((position, segment))
+                (position, segment)
             })
             .collect::<Vec<_>>();
         segment_positions.sort_by_key(|(position, segment)| (*position, segment.nav_index));
@@ -1553,10 +1553,10 @@ fn xhtml_anchor_ids(data: &[u8]) -> Vec<String> {
     ids
 }
 
-fn segment_for_spine_start<'a>(
+fn segment_for_spine_start(
     spine_index: usize,
-    segments: &'a [LogicalChapterSegment],
-) -> Option<&'a LogicalChapterSegment> {
+    segments: &[LogicalChapterSegment],
+) -> Option<&LogicalChapterSegment> {
     segments
         .iter()
         .take_while(|segment| segment.start.spine_index <= spine_index)
@@ -1638,7 +1638,7 @@ fn promote_anchor_to_heading(markdown: &str, fragment: &str, title: &str, level:
     }
     let mut output = String::new();
     output.push_str(&markdown[..marker_end]);
-    output.push_str("\n");
+    output.push('\n');
     if title_comparable_text(existing_block) == title_comparable_text(title) {
         output.push_str(&heading);
         output.push_str(&markdown[content_end..]);
