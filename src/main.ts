@@ -71,12 +71,14 @@ type ReadingProgress = {
   chapter_path: string;
   updated_ms: number;
   completed: boolean;
+  page_index?: number | null;
+  scroll_top?: number | null;
 };
 
 type ColorMode = 'system' | 'daylight' | 'dark';
 type ResolvedColorMode = 'daylight' | 'dark';
 type ReaderMode = 'scroll' | 'paged';
-type ReaderFontFamily = 'literata' | 'new-york' | 'iowan' | 'charter' | 'georgia' | 'palatino' | 'baskerville' | 'system-sans' | 'mono';
+type ReaderFontFamily = 'literata' | 'new-york' | 'iowan' | 'charter' | 'georgia' | 'palatino' | 'baskerville';
 
 type ReaderFontOption = {
   value: ReaderFontFamily;
@@ -124,6 +126,7 @@ type ReaderState = {
   pageIndex: number;
   pageCount: number;
   pendingPageTarget?: 'start' | 'end';
+  pendingScrollRestore: boolean;
   homeDeleteMode: boolean;
   libraryContextMenu?: {
     path: string;
@@ -149,8 +152,6 @@ const readerFontOptions: ReaderFontOption[] = [
   { value: 'georgia', label: 'Georgia', detail: 'Web serif' },
   { value: 'palatino', label: 'Palatino', detail: 'Wide serif' },
   { value: 'baskerville', label: 'Baskerville', detail: 'Literary serif' },
-  { value: 'system-sans', label: 'System Sans', detail: 'Interface sans' },
-  { value: 'mono', label: 'Mono', detail: 'Code style' },
 ];
 const defaultSidebarWidth = 320;
 const minSidebarWidth = 260;
@@ -189,6 +190,7 @@ const state: ReaderState = {
   pendingSearchScroll: false,
   pageIndex: 0,
   pageCount: 1,
+  pendingScrollRestore: false,
   homeDeleteMode: false,
 };
 const appElement = document.querySelector<HTMLDivElement>('#app');
@@ -212,6 +214,7 @@ let searchCacheBook: BookPayload | undefined;
 let searchCacheQuery = '';
 let searchCacheMatches: TextSearchMatch[] = [];
 let pagedLayoutTimer: number | undefined;
+let progressSaveTimer: number | undefined;
 const appLogoUrl = new URL('./assets/goosereader-logo.png', import.meta.url).href;
 
 document.documentElement.classList.toggle('tauri-runtime', hasTauriRuntime());
@@ -299,7 +302,7 @@ function renderShell(options: { preserveChapterScroll?: boolean; preserveReaderS
       </main>
     </div>
   `;
-  bindAppTitlebar();
+  bindTitlebarControls();
   document.querySelector<HTMLButtonElement>('#settings-toggle')?.addEventListener('click', () => {
     state.settingsOpen = !state.settingsOpen;
     renderShell();
@@ -315,42 +318,12 @@ function renderShell(options: { preserveChapterScroll?: boolean; preserveReaderS
       nextInput?.setSelectionRange(cursor, cursor);
     });
   });
-  document.querySelector<HTMLInputElement>('#reader-search')?.addEventListener('input', event => {
-    const input = event.currentTarget as HTMLInputElement;
-    updateReaderSearch(input.value, input.selectionStart ?? input.value.length);
-  });
-  document.querySelector<HTMLInputElement>('#reader-search')?.addEventListener('keydown', event => {
-    if (event.key !== 'Enter') return;
-    event.preventDefault();
-    moveSearchResult(event.shiftKey ? -1 : 1);
-  });
-  document.querySelector<HTMLButtonElement>('#search-previous')?.addEventListener('click', () => moveSearchResult(-1));
-  document.querySelector<HTMLButtonElement>('#search-next')?.addEventListener('click', () => moveSearchResult(1));
-  document.querySelector<HTMLButtonElement>('#search-clear')?.addEventListener('click', clearReaderSearch);
-  document.querySelector<HTMLButtonElement>('#toggle-completed')?.addEventListener('click', () => void toggleSelectedBookCompleted());
-  document.querySelectorAll<HTMLButtonElement>('[data-color-mode-choice]').forEach(button => {
-    button.addEventListener('click', () => setColorMode(button.dataset.colorModeChoice as ColorMode));
-  });
-  document.querySelector<HTMLButtonElement>('#font-size-decrease')?.addEventListener('click', () => adjustReaderFontSize(-1));
-  document.querySelector<HTMLButtonElement>('#font-size-increase')?.addEventListener('click', () => adjustReaderFontSize(1));
-  document.querySelector<HTMLButtonElement>('#reader-font-menu-button')?.addEventListener('click', event => {
-    event.stopPropagation();
-    toggleReaderFontMenu();
-  });
-  document.querySelectorAll<HTMLButtonElement>('[data-reader-font-choice]').forEach(button => {
-    button.addEventListener('click', () => setReaderFontFamily(button.dataset.readerFontChoice));
-  });
   document.querySelectorAll<HTMLButtonElement>('[data-toggle-library-sidebar]').forEach(button => {
     button.addEventListener('click', toggleLibrarySidebar);
   });
   document.querySelectorAll<HTMLButtonElement>('[data-toggle-outline-sidebar]').forEach(button => {
     button.addEventListener('click', toggleOutlineSidebar);
   });
-  if (state.readerFontMenuOpen) {
-    window.setTimeout(() => {
-      document.addEventListener('click', closeReaderFontMenuFromDocument, { once: true });
-    }, 0);
-  }
   document.querySelector<HTMLButtonElement>('#home-button')?.addEventListener('click', showHome);
   document.querySelector<HTMLButtonElement>('#all-books-button')?.addEventListener('click', showHome);
   document.querySelector<HTMLButtonElement>('#done-delete-mode')?.addEventListener('click', () => {
@@ -436,9 +409,54 @@ function renderShell(options: { preserveChapterScroll?: boolean; preserveReaderS
   bindLibraryContextMenuDismiss();
   bindReaderGestures();
   bindReaderLinks();
+  bindReaderProgressTracking();
   restoreChapterListScroll();
   if (options.preserveReaderScroll !== false) restoreReaderPaneScroll();
   void renderSelectedChapter(book, current);
+}
+
+function bindTitlebarControls(): void {
+  bindAppTitlebar();
+  document.querySelector<HTMLInputElement>('#reader-search')?.addEventListener('input', event => {
+    const input = event.currentTarget as HTMLInputElement;
+    updateReaderSearch(input.value, input.selectionStart ?? input.value.length);
+  });
+  document.querySelector<HTMLInputElement>('#reader-search')?.addEventListener('keydown', event => {
+    if (event.key !== 'Enter') return;
+    event.preventDefault();
+    moveSearchResult(event.shiftKey ? -1 : 1);
+  });
+  document.querySelector<HTMLButtonElement>('#search-previous')?.addEventListener('click', () => moveSearchResult(-1));
+  document.querySelector<HTMLButtonElement>('#search-next')?.addEventListener('click', () => moveSearchResult(1));
+  document.querySelector<HTMLButtonElement>('#search-clear')?.addEventListener('click', clearReaderSearch);
+  document.querySelector<HTMLButtonElement>('#toggle-completed')?.addEventListener('click', () => void toggleSelectedBookCompleted());
+  document.querySelectorAll<HTMLButtonElement>('[data-color-mode-choice]').forEach(button => {
+    button.addEventListener('click', () => setColorMode(button.dataset.colorModeChoice as ColorMode));
+  });
+  document.querySelector<HTMLButtonElement>('#font-size-decrease')?.addEventListener('click', () => adjustReaderFontSize(-1));
+  document.querySelector<HTMLButtonElement>('#font-size-increase')?.addEventListener('click', () => adjustReaderFontSize(1));
+  document.querySelector<HTMLButtonElement>('#reader-font-menu-button')?.addEventListener('click', event => {
+    event.stopPropagation();
+    toggleReaderFontMenu();
+  });
+  document.querySelectorAll<HTMLButtonElement>('[data-reader-font-choice]').forEach(button => {
+    button.addEventListener('click', () => setReaderFontFamily(button.dataset.readerFontChoice));
+  });
+  if (state.readerFontMenuOpen) {
+    window.setTimeout(() => {
+      document.addEventListener('click', closeReaderFontMenuFromDocument, { once: true });
+    }, 0);
+  }
+}
+
+function refreshAppTitlebar(): void {
+  const titlebar = document.querySelector<HTMLElement>('.app-titlebar');
+  if (!titlebar) {
+    renderShell();
+    return;
+  }
+  titlebar.outerHTML = appTitlebarContent(state.book, resolveColorMode(state.colorMode));
+  bindTitlebarControls();
 }
 
 function appTitlebarContent(book: BookPayload | undefined, resolvedColorMode: ResolvedColorMode): string {
@@ -552,20 +570,20 @@ function setColorMode(mode: ColorMode | undefined): void {
 function adjustReaderFontSize(delta: -1 | 1): void {
   state.readerFontSizePx = clampNumber(state.readerFontSizePx + delta, minReaderFontSizePx, maxReaderFontSizePx);
   persistReaderSettings();
-  renderShell();
+  applyReaderSettings();
   schedulePagedLayout();
 }
 
 function toggleReaderFontMenu(): void {
   state.readerFontMenuOpen = !state.readerFontMenuOpen;
-  renderShell();
+  refreshAppTitlebar();
 }
 
 function closeReaderFontMenuFromDocument(event: MouseEvent): void {
   if (event.target instanceof Element && event.target.closest('[data-font-menu]')) return;
   if (!state.readerFontMenuOpen) return;
   state.readerFontMenuOpen = false;
-  renderShell();
+  refreshAppTitlebar();
 }
 
 function setReaderFontFamily(fontFamily: unknown): void {
@@ -573,7 +591,8 @@ function setReaderFontFamily(fontFamily: unknown): void {
   state.readerFontFamily = fontFamily;
   state.readerFontMenuOpen = false;
   persistReaderSettings();
-  renderShell();
+  applyReaderSettings();
+  refreshAppTitlebar();
   schedulePagedLayout();
 }
 
@@ -691,7 +710,7 @@ function readStoredReaderFontFamily(): ReaderFontFamily {
   try {
     const stored = window.localStorage.getItem(readerFontFamilyStorageKey);
     if (stored === 'serif') return 'iowan';
-    if (stored === 'system') return 'system-sans';
+    if (stored === 'system' || stored === 'system-sans' || stored === 'mono') return 'literata';
     return isReaderFontFamily(stored) ? stored : 'literata';
   } catch {
     return 'literata';
@@ -729,6 +748,11 @@ function readStoredNumber(key: string, fallback: number, min: number, max: numbe
 
 function clampNumber(value: number, min: number, max: number): number {
   return Math.round(Math.min(max, Math.max(min, value)));
+}
+
+function clampProgressPosition(value: number | null | undefined): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return 0;
+  return Math.max(0, Math.round(value));
 }
 
 function toggleOutlineSidebar(): void {
@@ -1028,6 +1052,8 @@ function moveSearchResult(offset: 1 | -1): void {
 }
 
 function showHome(): void {
+  clearScheduledProgressSave();
+  void saveCurrentReadingProgress();
   renderedChapterCache.clear();
   state.book = undefined;
   state.selectedBookPath = undefined;
@@ -1039,6 +1065,7 @@ function showHome(): void {
   state.expandedChapterPaths = new Set();
   state.chapterListScrollTop = 0;
   state.readerPaneScrollTop = 0;
+  state.pendingScrollRestore = false;
   state.error = undefined;
   state.libraryContextMenu = undefined;
   renderShell({ preserveChapterScroll: false, preserveReaderScroll: false });
@@ -1274,8 +1301,6 @@ function readerFontStack(fontFamily: ReaderFontFamily): string {
   if (fontFamily === 'georgia') return 'Georgia, "Times New Roman", Times, serif';
   if (fontFamily === 'palatino') return '"Palatino Linotype", Palatino, "Book Antiqua", "Iowan Old Style", Georgia, serif';
   if (fontFamily === 'baskerville') return 'Baskerville, "Libre Baskerville", Georgia, serif';
-  if (fontFamily === 'system-sans') return 'Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
-  if (fontFamily === 'mono') return '"SF Mono", ui-monospace, Menlo, Monaco, Consolas, "Liberation Mono", monospace';
   return '"Literata", "Iowan Old Style", "Palatino Linotype", Palatino, Charter, "Book Antiqua", Georgia, serif';
 }
 
@@ -1420,6 +1445,10 @@ async function importEpub(): Promise<void> {
 }
 
 async function openLibraryBook(path: string): Promise<void> {
+  if (state.selectedBookPath !== path) {
+    clearScheduledProgressSave();
+    void saveCurrentReadingProgress();
+  }
   state.loading = true;
   state.error = undefined;
   state.selectedBookPath = path;
@@ -1427,8 +1456,7 @@ async function openLibraryBook(path: string): Promise<void> {
   try {
     const book = await invoke<BookPayload>('load_book_file', { path });
     const progress = await loadReadingProgress(path);
-    openBookPayload(book, path, progress?.chapter_path);
-    await saveCurrentReadingProgress();
+    openBookPayload(book, path, progress);
   } catch (error) {
     state.error = error instanceof Error ? error.message : String(error);
   } finally {
@@ -1496,10 +1524,13 @@ async function toggleSelectedBookCompleted(): Promise<void> {
 
 async function saveCurrentReadingProgress(): Promise<void> {
   if (!state.selectedBookPath || !state.selectedPath) return;
+  captureReaderPaneScroll();
   try {
     await invoke<void>('save_reading_progress', {
       path: state.selectedBookPath,
       chapterPath: state.selectedPath,
+      pageIndex: state.readerMode === 'paged' ? state.pageIndex : null,
+      scrollTop: state.readerMode === 'scroll' ? state.readerPaneScrollTop : null,
     });
     const book = selectedLibraryBook();
     if (book) {
@@ -1512,7 +1543,21 @@ async function saveCurrentReadingProgress(): Promise<void> {
   }
 }
 
-function openBookPayload(book: BookPayload, path: string, progressChapterPath?: string): void {
+function scheduleCurrentReadingProgressSave(): void {
+  if (progressSaveTimer) window.clearTimeout(progressSaveTimer);
+  progressSaveTimer = window.setTimeout(() => {
+    progressSaveTimer = undefined;
+    void saveCurrentReadingProgress();
+  }, 350);
+}
+
+function clearScheduledProgressSave(): void {
+  if (!progressSaveTimer) return;
+  window.clearTimeout(progressSaveTimer);
+  progressSaveTimer = undefined;
+}
+
+function openBookPayload(book: BookPayload, path: string, progress?: ReadingProgress): void {
   renderedChapterCache.clear();
   searchCacheBook = undefined;
   searchCacheQuery = '';
@@ -1522,11 +1567,12 @@ function openBookPayload(book: BookPayload, path: string, progressChapterPath?: 
   state.readerSearchQuery = '';
   state.searchActiveIndex = -1;
   state.pendingSearchScroll = false;
-  state.readerPaneScrollTop = 0;
-  state.pageIndex = 0;
+  state.readerPaneScrollTop = clampProgressPosition(progress?.scroll_top);
+  state.pageIndex = clampProgressPosition(progress?.page_index);
   state.pageCount = 1;
-  state.pendingPageTarget = 'start';
-  const progressChapter = book.chapters.find(chapter => chapter.path === progressChapterPath);
+  state.pendingPageTarget = state.pageIndex > 0 ? undefined : 'start';
+  state.pendingScrollRestore = state.readerPaneScrollTop > 0;
+  const progressChapter = book.chapters.find(chapter => chapter.path === progress?.chapter_path);
   const selectedPath = progressChapter?.path ?? book.chapters[0]?.path;
   state.selectedPath = selectedPath;
   state.pendingFragment = undefined;
@@ -1577,6 +1623,7 @@ async function renderSelectedChapter(book: BookPayload | undefined, chapter: Boo
     applySearchHighlights(target, chapter);
     updatePagedLayout();
     scrollPendingFragment();
+    restorePendingReaderScroll();
     return;
   }
 
@@ -1605,6 +1652,15 @@ async function renderSelectedChapter(book: BookPayload | undefined, chapter: Boo
   applySearchHighlights(target, chapter);
   updatePagedLayout();
   scrollPendingFragment();
+  restorePendingReaderScroll();
+}
+
+function restorePendingReaderScroll(): void {
+  if (!state.pendingScrollRestore || state.readerMode !== 'scroll') return;
+  const readerScrollContainer = currentReaderScrollContainer();
+  if (!readerScrollContainer) return;
+  readerScrollContainer.scrollTop = state.readerPaneScrollTop;
+  state.pendingScrollRestore = false;
 }
 
 function renderMarkdownFragment(book: BookPayload, chapter: BookChapter, markdown: string): string {
@@ -1666,6 +1722,7 @@ function setReaderPage(pageIndex: number): void {
   state.pageIndex = clampNumber(pageIndex, 0, Math.max(0, state.pageCount - 1));
   applyPagedScroll('smooth');
   updatePageControls();
+  scheduleCurrentReadingProgressSave();
 }
 
 function selectChapter(chapterPath: string, options: { fragment?: string; pageTarget?: 'start' | 'end' } = {}): void {
@@ -1689,6 +1746,16 @@ function captureChapterListScroll(): void {
 function captureReaderPaneScroll(): void {
   const readerScrollContainer = currentReaderScrollContainer();
   if (readerScrollContainer) state.readerPaneScrollTop = readerScrollContainer.scrollTop;
+}
+
+function bindReaderProgressTracking(): void {
+  const readerScrollContainer = currentReaderScrollContainer();
+  if (!readerScrollContainer) return;
+  readerScrollContainer.addEventListener('scroll', () => {
+    if (state.readerMode !== 'scroll') return;
+    captureReaderPaneScroll();
+    scheduleCurrentReadingProgressSave();
+  }, { passive: true });
 }
 
 function restoreChapterListScroll(): void {
@@ -1908,7 +1975,21 @@ function syncPagedPageWidth(content: HTMLElement): number {
 function applyPagedScroll(behavior: ScrollBehavior): void {
   const content = currentRenderedBookContent();
   if (!content || state.readerMode !== 'paged') return;
-  content.scrollTo({ left: state.pageIndex * syncPagedPageWidth(content), behavior });
+  const left = state.pageIndex * syncPagedPageWidth(content);
+  if (behavior === 'auto') {
+    const previousScrollBehavior = content.style.getPropertyValue('scroll-behavior');
+    content.style.setProperty('scroll-behavior', 'auto');
+    content.scrollTo({ left, behavior: 'auto' });
+    requestAnimationFrame(() => {
+      if (previousScrollBehavior) {
+        content.style.setProperty('scroll-behavior', previousScrollBehavior);
+      } else {
+        content.style.removeProperty('scroll-behavior');
+      }
+    });
+    return;
+  }
+  content.scrollTo({ left, behavior });
 }
 
 function pageIndexForPagedTarget(target: HTMLElement, content: HTMLElement): number {
@@ -2095,6 +2176,7 @@ function applySearchHighlights(scope: HTMLElement, chapter: BookChapter): void {
         state.pageIndex = pageIndexForPagedTarget(activeMark, content);
         applyPagedScroll('smooth');
         updatePageControls();
+        scheduleCurrentReadingProgressSave();
       }
     } else {
       activeMark.scrollIntoView({ block: 'center', behavior: 'smooth' });
@@ -2165,6 +2247,7 @@ function scrollPendingFragment(): void {
       state.pageIndex = pageIndexForPagedTarget(target, content);
       applyPagedScroll('smooth');
       updatePageControls();
+      scheduleCurrentReadingProgressSave();
     }
   } else {
     const readerScrollContainer = currentReaderScrollContainer();

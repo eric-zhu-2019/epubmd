@@ -1669,6 +1669,7 @@ select:disabled {
   line-height: 1.68;
   max-width: var(--reader-content-width);
   margin: 0 auto;
+  overflow-wrap: break-word;
   padding: 3.25rem 3.7rem;
 }
 
@@ -1681,6 +1682,7 @@ select:disabled {
   font-family: var(--reader-heading-font-family);
   letter-spacing: 0;
   line-height: 1.14;
+  overflow-wrap: anywhere;
 }
 
 .book-content p {
@@ -1692,22 +1694,24 @@ select:disabled {
     calc(var(--reader-content-width) + (var(--reader-page-inset) * 2)),
     calc(100vw - var(--library-column-width) - var(--sidebar-width, 320px) - 8rem)
   );
+  box-sizing: border-box;
   column-fill: auto;
-  column-gap: 0;
-  column-width: var(--paged-page-width, var(--reader-paged-width));
+  column-gap: calc(var(--reader-page-inset) * 2);
+  column-width: max(16rem, calc(var(--paged-page-width, var(--reader-paged-width)) - (var(--reader-page-inset) * 2)));
   flex: 1 1 auto;
   height: auto;
   max-width: var(--reader-paged-width);
   overflow: hidden;
-  padding-left: 0;
-  padding-right: 0;
+  padding-left: var(--reader-page-inset);
+  padding-right: var(--reader-page-inset);
   scroll-behavior: smooth;
   width: var(--reader-paged-width);
 }
 
 .reader-card.paged .book-content > * {
-  margin-left: var(--reader-page-inset);
-  margin-right: var(--reader-page-inset);
+  box-sizing: border-box;
+  max-width: 100%;
+  min-width: 0;
 }
 
 .reader-card.paged .book-content h1,
@@ -1721,6 +1725,17 @@ select:disabled {
 .reader-card.paged .book-content table,
 .reader-card.paged .book-content img {
   break-inside: avoid;
+}
+
+.book-content img {
+  height: auto;
+  max-width: 100%;
+}
+
+.book-content table {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
 }
 
 .book-content ul,

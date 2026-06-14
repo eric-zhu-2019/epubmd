@@ -92,6 +92,10 @@ struct ReadingProgress {
     updated_ms: u64,
     #[serde(default)]
     completed: bool,
+    #[serde(default)]
+    page_index: Option<u32>,
+    #[serde(default)]
+    scroll_top: Option<u32>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -158,11 +162,18 @@ fn load_reading_progress(path: String) -> Result<Option<ReadingProgress>, String
 }
 
 #[tauri::command]
-fn save_reading_progress(path: String, chapter_path: String) -> Result<(), String> {
+fn save_reading_progress(
+    path: String,
+    chapter_path: String,
+    page_index: Option<u32>,
+    scroll_top: Option<u32>,
+) -> Result<(), String> {
     let books_dir = ensure_books_dir()?;
     save_reading_progress_in_dir(
         Path::new(&path),
         &chapter_path,
+        page_index,
+        scroll_top,
         &books_dir,
         &progress_store_path()?,
     )
@@ -207,7 +218,8 @@ fn appearance_from_dark_flag(is_dark: bool, source: &'static str) -> SystemAppea
 
 #[cfg(target_os = "macos")]
 fn platform_system_appearance() -> Option<SystemAppearance> {
-    let script = "tell application \"System Events\" to tell appearance preferences to get dark mode";
+    let script =
+        "tell application \"System Events\" to tell appearance preferences to get dark mode";
     if let Ok(output) = Command::new("osascript").args(["-e", script]).output() {
         if output.status.success() {
             if let Some(is_dark) = parse_bool_command_output(&output.stdout) {
@@ -236,7 +248,11 @@ fn platform_system_appearance() -> Option<SystemAppearance> {
 }
 
 fn parse_bool_command_output(output: &[u8]) -> Option<bool> {
-    match String::from_utf8_lossy(output).trim().to_ascii_lowercase().as_str() {
+    match String::from_utf8_lossy(output)
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "true" => Some(true),
         "false" => Some(false),
         _ => None,
@@ -258,6 +274,8 @@ fn load_reading_progress_in_dir(
 fn save_reading_progress_in_dir(
     path: &Path,
     chapter_path: &str,
+    page_index: Option<u32>,
+    scroll_top: Option<u32>,
     books_dir: &Path,
     progress_path: &Path,
 ) -> Result<(), String> {
@@ -278,6 +296,8 @@ fn save_reading_progress_in_dir(
             chapter_path: chapter_path.to_string(),
             updated_ms: now_ms(),
             completed,
+            page_index,
+            scroll_top,
         },
     );
     write_progress_store_to(progress_path, &store)
@@ -310,6 +330,8 @@ fn set_book_completed_in_dir(
             chapter_path: next_chapter_path,
             updated_ms: now_ms(),
             completed,
+            page_index: existing.as_ref().and_then(|progress| progress.page_index),
+            scroll_top: existing.as_ref().and_then(|progress| progress.scroll_top),
         },
     );
     write_progress_store_to(progress_path, &store)
@@ -972,10 +994,9 @@ pub fn run() {
                     .min_inner_size(760.0, 560.0);
 
             #[cfg(target_os = "macos")]
-            let window_builder =
-                window_builder
-                    .hidden_title(true)
-                    .title_bar_style(tauri::TitleBarStyle::Overlay);
+            let window_builder = window_builder
+                .hidden_title(true)
+                .title_bar_style(tauri::TitleBarStyle::Overlay);
 
             window_builder.build()?;
             Ok(())
@@ -1179,6 +1200,8 @@ mod tests {
         save_reading_progress_in_dir(
             &book_path,
             "chapters/001-One.md",
+            Some(7),
+            Some(420),
             &books_dir,
             &progress_path,
         )
@@ -1187,6 +1210,8 @@ mod tests {
             .expect("load progress")
             .expect("progress exists");
         assert_eq!(progress.chapter_path, "chapters/001-One.md");
+        assert_eq!(progress.page_index, Some(7));
+        assert_eq!(progress.scroll_top, Some(420));
         assert!(!progress.completed);
 
         let progress_store = read_progress_store_from(&progress_path).expect("read progress store");
@@ -1211,6 +1236,8 @@ mod tests {
             .expect("load completed progress")
             .expect("progress exists");
         assert_eq!(progress.chapter_path, "chapters/001-One.md");
+        assert_eq!(progress.page_index, Some(7));
+        assert_eq!(progress.scroll_top, Some(420));
         assert!(progress.completed);
         let progress_store = read_progress_store_from(&progress_path).expect("read progress store");
         let books =
